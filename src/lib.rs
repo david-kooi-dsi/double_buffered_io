@@ -1,0 +1,18 @@
+//! Double-buffered I/O pipeline library
+//! 
+//! This library provides a high-performance, event-driven I/O pipeline
+//! with double-buffering for continuous data flow.
+
+pub mod transport;
+pub mod double_buffered_io;
+
+// Re-export main types for convenience
+pub use transport::{Transport, UartTransport, UdpTransport, Error};
+pub use double_buffered_io::{
+    DoubleBufferedIO, 
+    DataProcessor, 
+    PassThroughProcessor,
+    PipelineConfig,
+    PipelineMetrics,
+    PipelineError,
+};
