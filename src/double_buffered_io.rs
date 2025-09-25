@@ -1,6 +1,5 @@
 // double_buffered_io.rs
 
-use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -11,6 +10,7 @@ use thiserror::Error;
 
 // Re-export or define the Transport trait here
 use crate::transport::Transport;
+use crate::processor::DataProcessor;
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -37,39 +37,6 @@ pub enum BufferState {
     Empty,
 }
 
-/// Generic data processor trait
-#[async_trait]
-pub trait DataProcessor: Send + Sync {
-    /// Process a buffer of data
-    /// 
-    /// # Arguments
-    /// * `input` - Input data buffer
-    /// 
-    /// # Returns
-    /// * Processed data
-    async fn process(&self, input: Vec<u8>) -> Result<Vec<u8>, PipelineError>;
-}
-
-/// Pass-through processor that just delays and returns input
-pub struct PassThroughProcessor {
-    delay: Duration,
-}
-
-impl PassThroughProcessor {
-    pub fn new(delay: Duration) -> Self {
-        Self { delay }
-    }
-}
-
-#[async_trait]
-impl DataProcessor for PassThroughProcessor {
-    async fn process(&self, input: Vec<u8>) -> Result<Vec<u8>, PipelineError> {
-        if self.delay > Duration::ZERO {
-            sleep(self.delay).await;
-        }
-        Ok(input)
-    }
-}
 
 /// Buffer with state tracking
 struct Buffer {
@@ -621,6 +588,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use crate::processor::PassThroughProcessor;
+    use async_trait::async_trait;
 
     // Mock transport for testing
     #[derive(Clone)]
@@ -676,13 +645,6 @@ mod tests {
         fn set_timeout(&mut self, _timeout: Duration) {}
     }
 
-    #[tokio::test]
-    async fn test_pass_through_processor() {
-        let processor = PassThroughProcessor::new(Duration::from_millis(10));
-        let input = vec![1, 2, 3, 4, 5];
-        let output = processor.process(input.clone()).await.unwrap();
-        assert_eq!(input, output);
-    }
 
     #[tokio::test]
     async fn test_buffer_operations() {
