@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::time::Duration;
 use std::net::SocketAddr;
-use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use std::sync::Arc;
