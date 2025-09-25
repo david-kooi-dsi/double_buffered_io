@@ -9,9 +9,13 @@ use double_buffered_io::{
 use std::env;
 use std::time::Duration;
 use tokio::time::sleep;
+use env_logger;
+
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
 

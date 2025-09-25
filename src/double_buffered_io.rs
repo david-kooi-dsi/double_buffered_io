@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::time::sleep;
 use std::collections::VecDeque;
 use thiserror::Error;
+use log::{info, warn, debug, error};
 
 // Re-export or define the Transport trait here
 use crate::transport::Transport;
@@ -139,6 +140,9 @@ impl DoubleBuffer {
     async fn get_standby(&self) -> Arc<Mutex<Buffer>> {
         let index = self.active_index.load(Ordering::Acquire);
         self.buffers[1 - index].clone()
+    }
+    fn get_active_index(&self) -> usize{
+        self.active_index.load(Ordering::Relaxed)
     }
 
     async fn swap(&self) -> Result<(), PipelineError> {
@@ -290,9 +294,16 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
             return Ok(()); // Already running
         }
 
+        // Fill the active output buffer
+        let zeros = vec![0; self.config.buffer_size];
+        self.output_buffers.get_active().await.lock().await.write(&zeros[..self.config.buffer_size]);
+        
         let input_handle = self.spawn_input_context();
+        info!("input handle started");
         let processing_handle = self.spawn_processing_context();
+        info!("processing handle started");
         let output_handle = self.spawn_output_context();
+        info!("output handle started");
 
         // Store handles if needed for graceful shutdown
         tokio::spawn(async move {
@@ -352,21 +363,36 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                     Ok(bytes_read) if bytes_read > 0 => {
                         drop(transport_guard);
                         
+                        debug!("Input: received {bytes_read} bytes");
+                        // Signal the output thread about received bytes
+                        byte_signal.signal_bytes(bytes_read);
+
                         // Write to active input buffer
-                        let active_buffer = input_buffers.get_active().await;
+                        let active_buffer: Arc<Mutex<Buffer>> = input_buffers.get_active().await;
                         let mut buffer = active_buffer.lock().await;
                         
-                        let written = buffer.write(&read_buffer[..bytes_read]);
-                        metrics.input_bytes.fetch_add(written, Ordering::Relaxed);
+                        let ai = input_buffers.get_active_index();
+                        debug!("Input: active Index: {ai}");
 
-                        // Signal the output thread about received bytes
-                        byte_signal.signal_bytes(written);
+                        let written = buffer.write(&read_buffer[..bytes_read]);
+                        debug!("Input: {:?}", &read_buffer[..written]);
+                        let remaining_bytes = bytes_read - written;
+                        metrics.input_bytes.fetch_add(written, Ordering::Relaxed);
+                        
+                        debug!("Input: Added {written} bytes to input buffer and request {bytes_read} bytes to be output");
+                        if remaining_bytes > 0 {
+                            debug!("Input: {remaining_bytes} Bytes need to be added to next active buffer");
+                        }
+
 
                         // Check if buffer is full and needs swapping
                         if buffer.is_full() {
                             let data = buffer.get_data();
                             buffer.clear();
                             drop(buffer);
+
+                            let len = data.len();
+                            debug!("Input: Input buffer is full. Sending {len} bytes to processing");
 
                             // Queue for processing
                             let mut queue = processing_queue.lock().await;
@@ -376,7 +402,22 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                             // Attempt buffer swap
                             if let Err(e) = input_buffers.swap().await {
                                 metrics.overflow_count.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("Input buffer swap failed: {}", e);
+                                error!("Input buffer swap failed: {}", e);
+                            } else {
+                                // Buffer swap successful
+                                if remaining_bytes > 0 {
+                                    debug!("Adding remaining {remaining_bytes} bytes to new active buffer.");
+                                    let new_active = input_buffers.get_active().await;
+                                    let mut new_active = new_active.lock().await;
+
+                                    let new_written = new_active.write(&read_buffer[bytes_read-remaining_bytes..bytes_read]);
+                                    debug!("New Written: {new_written}");
+                                    
+                                    // assert!(remaining_bytes >= new_written);
+                                    let remaining_bytes = remaining_bytes - new_written;
+                                    debug!("Input: Remaining Bytes: {remaining_bytes}");
+                                    debug!("Input: New Buffer {:?}", new_active.get_data());
+                                }
                             }
                         }
                     }
@@ -387,11 +428,11 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                     }
                     Err(e) => {
                         if running.load(Ordering::Relaxed) {
-                            eprintln!("Transport receive error: {}", e);
+                            warn!("Transport receive error: {}", e);
                         }
                         drop(transport_guard);
                         // Small delay before retrying on error
-                        sleep(Duration::from_millis(10)).await;
+                        sleep(Duration::from_millis(5)).await;
                     }
                 }
             }
@@ -417,6 +458,10 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                 };
 
                 if let Some(input_data) = data {
+                    let len = input_data.len();
+                    debug!("Processing: Dequeued {len} bytes to process.");
+                    debug!("Processing: Starting process...");
+                    debug!("Processing: {:?}", input_data);
                     let start = Instant::now();
 
                     // Process with timeout
@@ -433,47 +478,14 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                                 Ordering::Relaxed
                             );
 
-                            // Write to output buffer
-                            let mut remaining = processed_data;
-                            while !remaining.is_empty() {
-                                let active_buffer = output_buffers.get_active().await;
-                                let mut buffer = active_buffer.lock().await;
-
-                                let to_write = remaining.len().min(buffer.available_space());
-                                if to_write == 0 {
-                                    // Buffer is full, swap and continue
-                                    let data = buffer.get_data();
-                                    buffer.clear();
-                                    drop(buffer);
-
-                                    let mut queue = output_queue.lock().await;
-                                    queue.push_back(data);
-                                    drop(queue);
-
-                                    if let Err(e) = output_buffers.swap().await {
-                                        eprintln!("Output buffer swap failed: {}", e);
-                                        break;
-                                    }
-                                } else {
-                                    buffer.write(&remaining[..to_write]);
-                                    remaining.drain(..to_write);
-
-                                    // If buffer is full after writing, queue it
-                                    if buffer.is_full() {
-                                        let data = buffer.get_data();
-                                        buffer.clear();
-                                        drop(buffer);
-
-                                        let mut queue = output_queue.lock().await;
-                                        queue.push_back(data);
-                                        drop(queue);
-
-                                        let _ = output_buffers.swap().await;
-                                    } else {
-                                        drop(buffer);
-                                    }
-                                }
-                            }
+                            let len = processed_data.len();
+                            debug!("Processing: Finished Processing. Output data size: {len} bytes");
+                            
+                            // Processed data is Vec<u8?
+                            let mut queue = output_queue.lock().await;
+                            queue.push_back(processed_data);
+                            drop(queue);
+  
                         }
                         Ok(Err(e)) => {
                             eprintln!("Processing error: {}", e);
@@ -484,7 +496,7 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                     }
                 } else {
                     // No data to process, wait a bit
-                    sleep(Duration::from_millis(10)).await;
+                    sleep(Duration::from_millis(5)).await;
                 }
             }
         })
@@ -500,64 +512,98 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
         let byte_signal = self.byte_signal.clone();
 
         tokio::spawn(async move {
-            let mut current_output_data: Option<Vec<u8>> = None;
             let mut output_position = 0;
 
             while running.load(Ordering::Relaxed) {
                 // Wait for signal about how many bytes to send
+                // Precense of input data is the driver of when to output data
                 match byte_signal.wait_bytes().await {
                     Some(bytes_to_send) if bytes_to_send > 0 => {
+                        debug!("Output: {bytes_to_send} bytes requested for output");
+
+                        let mut output_data: Vec<u8> = vec![];
+
+                        // Check if active buffer has bytes to send
                         let mut remaining_bytes = bytes_to_send;
+                        
+                        // Take at most two passes to get data.
+                        // First pass gets available data from active buffer. If nessecary, swap buffers and attempt
+                        // to get more data from the next one.
+                        for _ in 0..3 {
+                            let active_buffer = output_buffers.get_active().await;
+                            let mut buffer = active_buffer.lock().await;
+                            
+                            debug!("Output: Active Buffer: {:?}", buffer.get_data());
+                            if !buffer.is_empty(){
+                                let new_data = buffer.read(remaining_bytes);
 
-                        while remaining_bytes > 0 && running.load(Ordering::Relaxed) {
-                            // Get data from current buffer or queue
-                            if current_output_data.is_none() || output_position >= current_output_data.as_ref().unwrap().len() {
-                                // Need new data from queue or active buffer
-                                let mut queue = output_queue.lock().await;
-                                current_output_data = queue.pop_front();
-                                drop(queue);
+                                let data_read = new_data.len();
+                                remaining_bytes -= new_data.len();
+                                debug!("Output: Bytes read from active buffer: {data_read} Remaining Bytes: {remaining_bytes}");
 
-                                // If no queued data, try to get from active output buffer
-                                if current_output_data.is_none() {
-                                    let active_buffer = output_buffers.get_active().await;
-                                    let mut buffer = active_buffer.lock().await;
-                                    if buffer.fill_level > 0 {
-                                        current_output_data = Some(buffer.get_data());
-                                        buffer.clear();
-                                    }
-                                    drop(buffer);
+                                output_data.extend(new_data);
+                                if remaining_bytes > 0 {
+                                    assert!(buffer.is_empty());
+                                } else {
+                                    debug!("Total number of requested bytes collected.");
+                                    break;
                                 }
+                            } 
 
-                                output_position = 0;
-                            }
+                            // If empty, we need to swap
+                            if buffer.is_empty() {
+                                debug!("Output: Need more data...swapping buffers and checking queue.");
+                                sleep(Duration::from_millis(2)).await;
 
-                            if let Some(ref data) = current_output_data {
-                                let available = data.len() - output_position;
-                                let to_send = available.min(remaining_bytes);
+                                match output_buffers.swap().await {
+                                    Ok(_) => {
 
-                                if to_send > 0 {
-                                    let chunk = &data[output_position..output_position + to_send];
-
-                                    let transport_guard = transport.read().await;
-                                    match transport_guard.send(chunk).await {
-                                        Ok(()) => {
-                                            output_position += to_send;
-                                            remaining_bytes -= to_send;
-                                            metrics.output_bytes.fetch_add(to_send, Ordering::Relaxed);
+                                        let new_data = {
+                                            let mut queue = output_queue.lock().await;
+                                            queue.pop_front()
+                                        };
+                                        // If we have new data from the processor, add to our double buffer
+                                        if let Some(new_data) = new_data{
+                                            let buf = output_buffers.get_active().await;
+                                            buf.lock().await.write(&new_data);
+                                            debug!("Output: Got new data from processor: {:?}", buf.lock().await.get_data());
+                                            
+                                        } else {
+                                            debug!("No new data.");
                                         }
-                                        Err(e) => {
-                                            eprintln!("Transport send error: {}", e);
-                                            break;
-                                        }
+                                        continue; // Swap successful, get more data 
                                     }
-                                    drop(transport_guard);
+                                    Err(e) => {
+                                        warn!("Output: Error in buffer swap: {e}");
+                                        break;
+                                    }
                                 }
-                            } else {
-                                // No data available yet - wait a bit for processing
-                                metrics.underflow_count.fetch_add(1, Ordering::Relaxed);
-                                sleep(Duration::from_millis(1)).await;
                             }
                         }
+                    
+                        if remaining_bytes > 0 {
+                            output_data.extend(vec![0u8; remaining_bytes]);
+                            debug!("Output: {:?}", output_data);
+                            metrics.underflow_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        else {
+                            debug!("Output: {:?}", output_data);
+                        }
+
+                        // Send out over the transport
+                        let data_as_array = output_data.as_slice();
+                        let transport_guard = transport.read().await;
+                        match transport_guard.send(data_as_array).await {
+                            Ok(()) => {
+                                metrics.output_bytes.fetch_add(output_data.len(), Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                eprintln!("Transport send error: {}", e);
+                                break;
+                            }
+                        }
+                        drop(transport_guard);
+
                     }
                     Some(0) => {
                         // Signal to stop
@@ -590,6 +636,20 @@ mod tests {
     use tokio::sync::Mutex;
     use crate::processor::PassThroughProcessor;
     use async_trait::async_trait;
+    use env_logger;
+    use std::sync::{Once};
+
+
+    static INIT: Once = Once::new();
+
+    fn init_logger() {
+        INIT.call_once(|| {
+            env_logger::Builder::from_env(
+                env_logger::Env::default().default_filter_or("debug")
+            ).init();
+        });
+    }
+
 
     // Mock transport for testing
     #[derive(Clone)]
@@ -742,24 +802,100 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_basic_flow() {
+        init_logger();
+
+
         let transport = MockTransport::new();
-        let processor = PassThroughProcessor::new(Duration::from_millis(5));
+        let processor = PassThroughProcessor::new(Duration::from_millis(1));
         
         let config = PipelineConfig {
-            buffer_size: 100,
+            buffer_size: 8,
             max_processing_time: Duration::from_secs(1),
             timeout: Duration::from_secs(5),
             read_chunk_size: 50,
         };
         
-        let pipeline = DoubleBufferedIO::new(transport, processor, config);
+
+        let pipeline = DoubleBufferedIO::new(transport.clone(), processor, config);
         
         // Start pipeline
         pipeline.start().await.unwrap();
-        
         // Let it run for a bit
         sleep(Duration::from_millis(100)).await;
+        let input_data: [u8; 4] = [1,1,1,1];
+        transport.add_input_data(&input_data).await;
+        sleep(Duration::from_millis(100)).await;
+        let input_data: [u8; 4] = [2,2,2,2];
+        transport.add_input_data(&input_data).await;
+        sleep(Duration::from_millis(100)).await;
+        let input_data: [u8; 4] = [3,3,3,3];
+        transport.add_input_data(&input_data).await;
+        sleep(Duration::from_millis(100)).await;
+        let input_data: [u8; 4] = [4,4,4,4];
+        transport.add_input_data(&input_data).await;
+        sleep(Duration::from_millis(100)).await;
+        let input_data: [u8; 4] = [5,5,5,5];
+        transport.add_input_data(&input_data).await;
+        sleep(Duration::from_millis(100)).await;
+        let input_data: [u8; 4] = [6,6,6,6];
+        transport.add_input_data(&input_data).await;
+
+        let loopback_data = transport.get_sent_data().await;
+        info!("Recevied data: {:?}", loopback_data);
+
+        // Check metrics
+        let metrics = pipeline.metrics();
+        assert_eq!(metrics.overflow_count.load(Ordering::Relaxed), 0);
         
+        // Stop pipeline
+        pipeline.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_streaming_flow() {
+        init_logger();
+
+        let transport = MockTransport::new();
+        let processor = PassThroughProcessor::new(Duration::from_millis(1));
+        
+        let config = PipelineConfig {
+            buffer_size: 32,
+            max_processing_time: Duration::from_secs(1),
+            timeout: Duration::from_secs(5),
+            read_chunk_size: 8,
+        };
+        
+
+        let pipeline = DoubleBufferedIO::new(transport.clone(), processor, config);
+        
+        // Start pipeline
+        pipeline.start().await.unwrap();
+        // Let it run for a bit
+        for i in (1..=128).step_by(3) {
+            sleep(Duration::from_millis(20)).await;
+            let input_data = [i, i + 1, i + 2];
+            debug!("Sending: {:?}", input_data);
+            transport.add_input_data(&input_data).await;
+        }
+
+        let loopback_data: Vec<i8> = transport.get_sent_data().await.into_iter().map(|x| x as i8).collect();
+        info!("Recevied data: {:?}", loopback_data);
+
+        for i in 0..loopback_data.len()-1 {
+            if loopback_data[i] == 0 && loopback_data[i+1] == 0 {
+                continue;
+            }
+            
+            if loopback_data[i] != loopback_data[i+1]-1 {
+                error!("Consecutive data mismatch");
+                let a = loopback_data[i];
+                let b = loopback_data[i+1];
+            
+                error!("{a} | {b}");
+                assert!(false);
+            }
+        }
+
         // Check metrics
         let metrics = pipeline.metrics();
         assert_eq!(metrics.overflow_count.load(Ordering::Relaxed), 0);
