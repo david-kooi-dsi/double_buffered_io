@@ -15,8 +15,9 @@ use env_logger;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
-
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("debug")
+    ).init();
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
 
