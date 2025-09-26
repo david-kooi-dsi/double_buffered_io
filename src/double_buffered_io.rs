@@ -375,6 +375,7 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                         debug!("Input: active Index: {ai}");
 
                         let written = buffer.write(&read_buffer[..bytes_read]);
+
                         debug!("Input: {:?}", &read_buffer[..written]);
                         let remaining_bytes = bytes_read - written;
                         metrics.input_bytes.fetch_add(written, Ordering::Relaxed);

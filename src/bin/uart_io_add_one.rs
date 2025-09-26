@@ -3,6 +3,7 @@
 // Usage: cargo run --bin uart_io_add_one <device> <baud>
 // Example: cargo run --bin uart_io_add_one /dev/ttyUSB0 115200
 
+use double_buffered_io::transport::UartTransportFixedInput;
 use double_buffered_io::{
     DoubleBufferedIO, UartTransport, AddOneProcessor, PipelineConfig
 };
@@ -40,7 +41,8 @@ async fn main() {
     println!();
 
     // Create UART transport
-    let transport = match UartTransport::new(device, baud_rate).await {
+    let fixed_input_size = 50;
+    let transport = match UartTransportFixedInput::new(device, baud_rate, fixed_input_size).await {
         Ok(transport) => {
             println!("✓ Successfully opened UART connection to {}", device);
             transport
@@ -64,7 +66,7 @@ async fn main() {
         buffer_size: 2048,
         max_processing_time: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
-        read_chunk_size: 256,
+        read_chunk_size: fixed_input_size,
     };
 
     // Create double-buffered I/O pipeline

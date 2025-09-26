@@ -352,6 +352,165 @@ impl Transport for UdpTransport {
     }
 }
 
+pub struct UartTransportFixedInput {
+    port: Arc<Mutex<tokio_serial::SerialStream>>,
+    timeout: Arc<Mutex<Duration>>,
+    port_name: String,
+    baud_rate: u32,
+    fixed_receive_size: usize,
+}
+
+impl UartTransportFixedInput {
+    /// Create a new UART transport with fixed input size
+    /// 
+    /// # Arguments
+    /// 
+    /// * `port_name` - Serial port name (e.g., "/dev/ttyUSB0" on Linux, "COM3" on Windows)
+    /// * `baud_rate` - Baud rate for the serial connection
+    /// * `fixed_receive_size` - Fixed number of bytes to receive in each receive() call
+    /// 
+    /// # Returns
+    /// 
+    /// * `Result<Self, Error>` - New UartTransportFixedInput instance or error
+    pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
+        let port = tokio_serial::new(port_name, baud_rate)
+            .timeout(Duration::from_secs(1))
+            .open_native_async()?;
+
+        Ok(Self {
+            port: Arc::new(Mutex::new(port)),
+            timeout: Arc::new(Mutex::new(Duration::from_secs(5))),
+            port_name: port_name.to_string(),
+            baud_rate,
+            fixed_receive_size,
+        })
+    }
+
+    /// Reconfigure the serial port with new settings
+    /// 
+    /// # Arguments
+    /// 
+    /// * `baud_rate` - New baud rate
+    /// 
+    /// # Returns
+    /// 
+    /// * `Result<(), Error>` - Ok on success
+    pub async fn reconfigure(&mut self, baud_rate: u32) -> Result<(), Error> {
+        self.baud_rate = baud_rate;
+        
+        // Close existing port and reopen with new settings
+        let new_port = tokio_serial::new(&self.port_name, baud_rate)
+            .timeout(*self.timeout.lock().await)
+            .open_native_async()?;
+            
+        *self.port.lock().await = new_port;
+        Ok(())
+    }
+
+    /// Get current port configuration
+    pub fn get_config(&self) -> (String, u32, usize) {
+        (
+            self.port_name.clone(),
+            self.baud_rate,
+            self.fixed_receive_size,
+        )
+    }
+
+    /// Receive exactly `fixed_receive_size` bytes, blocking until all are received
+    /// 
+    /// # Arguments
+    /// 
+    /// * `buffer` - Buffer to store received data (must be at least `fixed_receive_size` bytes)
+    /// 
+    /// # Returns
+    /// 
+    /// * `Result<(), Error>` - Ok when exactly `fixed_receive_size` bytes have been received
+    /// 
+    /// # Panics
+    /// 
+    /// Panics if `fixed_receive_size` is greater than `buffer.len()`
+    pub async fn receive_full(&self, buffer: &mut [u8]) -> Result<(), Error> {
+        if self.fixed_receive_size > buffer.len() {
+            panic!("Fixed receive size ({}) exceeds buffer length ({})", 
+                   self.fixed_receive_size, buffer.len());
+        }
+
+        let mut port = self.port.lock().await;
+        let timeout = *self.timeout.lock().await;
+        let mut total_received = 0;
+
+        while total_received < self.fixed_receive_size {
+            let remaining = self.fixed_receive_size - total_received;
+            let buffer_slice = &mut buffer[total_received..total_received + remaining];
+            
+            match tokio::time::timeout(timeout, port.read(buffer_slice)).await {
+                Ok(Ok(bytes_read)) => {
+                    if bytes_read == 0 {
+                        // Handle EOF or connection closed
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Connection closed before receiving all data"
+                        )));
+                    }
+                    total_received += bytes_read;
+                }
+                Ok(Err(e)) => {
+                    // Handle non-blocking case differently - retry instead of returning error
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        // Small delay to prevent busy waiting
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    } else {
+                        return Err(Error::Io(e));
+                    }
+                }
+                Err(_) => return Err(Error::Timeout),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Transport for UartTransportFixedInput {
+    async fn send(&self, data: &[u8]) -> Result<(), Error> {
+        let mut port = self.port.lock().await;
+        let timeout = *self.timeout.lock().await;
+        
+        match tokio::time::timeout(timeout, port.write_all(data)).await {
+            Ok(Ok(())) => {
+                // Ensure data is flushed
+                port.flush().await?;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(Error::Io(e)),
+            Err(_) => Err(Error::Timeout),
+        }
+    }
+
+    async fn receive(&self, buffer: &mut [u8]) -> Result<usize, Error> {
+        // Use the fixed-size receive implementation
+        self.receive_full(buffer).await?;
+        Ok(self.fixed_receive_size)
+    }
+
+    async fn receive_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
+        Err(Error::InvalidOperation("receive_from not implemented".to_string()))
+    }
+
+    async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<(), Error> {
+        Err(Error::InvalidOperation("send_to not implemented".to_string()))
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) {
+        let timeout_mutex = self.timeout.clone();
+        tokio::spawn(async move {
+            *timeout_mutex.lock().await = timeout;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
