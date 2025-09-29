@@ -392,12 +392,12 @@ impl UartTransportFixedInput {
     /// * `Result<Self, Error>` - New UartTransportFixedInput instance or error
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
         let port = tokio_serial::new(port_name, baud_rate)
-            .timeout(Duration::from_secs(1))
+            .timeout(Duration::from_millis(100))
             .open_native_async()?;
 
         Ok(Self {
             port: Arc::new(Mutex::new(port)),
-            timeout: Arc::new(Mutex::new(Duration::from_secs(5))),
+            timeout: Arc::new(Mutex::new(Duration::from_millis(500))),
             port_name: port_name.to_string(),
             baud_rate,
             fixed_receive_size,
@@ -435,33 +435,35 @@ impl UartTransportFixedInput {
     }
 
     /// Receive exactly `fixed_receive_size` bytes, blocking until all are received
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `buffer` - Buffer to store received data (must be at least `fixed_receive_size` bytes)
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// * `Result<(), Error>` - Ok when exactly `fixed_receive_size` bytes have been received
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if `fixed_receive_size` is greater than `buffer.len()`
     pub async fn receive_full(&self, buffer: &mut [u8]) -> Result<(), Error> {
         if self.fixed_receive_size > buffer.len() {
-            panic!("Fixed receive size ({}) exceeds buffer length ({})", 
+            panic!("Fixed receive size ({}) exceeds buffer length ({})",
                    self.fixed_receive_size, buffer.len());
         }
 
         let mut port = self.port.lock().await;
-        let timeout = *self.timeout.lock().await;
         let mut total_received = 0;
 
         while total_received < self.fixed_receive_size {
             let remaining = self.fixed_receive_size - total_received;
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
-            
-            match tokio::time::timeout(timeout, port.read(buffer_slice)).await {
+
+            // Use a much shorter timeout for individual reads to avoid missing packets
+            let short_timeout = Duration::from_millis(100);
+
+            match tokio::time::timeout(short_timeout, port.read(buffer_slice)).await {
                 Ok(Ok(bytes_read)) => {
                     if bytes_read == 0 {
                         // Handle EOF or connection closed
@@ -473,16 +475,21 @@ impl UartTransportFixedInput {
                     total_received += bytes_read;
                 }
                 Ok(Err(e)) => {
-                    // Handle non-blocking case differently - retry instead of returning error
+                    // Handle non-blocking case - retry without delay for better responsiveness
                     if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // Small delay to prevent busy waiting
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        // Use yield_now instead of sleep for better responsiveness
+                        tokio::task::yield_now().await;
                         continue;
                     } else {
                         return Err(Error::Io(e));
                     }
                 }
-                Err(_) => return Err(Error::Timeout),
+                Err(_) => {
+                    // Short timeout occurred - yield and retry instead of failing
+                    // This allows the function to stay responsive to new data
+                    tokio::task::yield_now().await;
+                    continue;
+                }
             }
         }
 
