@@ -35,7 +35,7 @@ impl RingBuffer {
             capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
-            available: AtomicUsize::new(capacity), // Initially filled with zeros
+            available: AtomicUsize::new(0), // Initially empty
         }
     }
 
@@ -220,7 +220,8 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
         // Pre-fill output buffer with zeros (so initial outputs work)
         {
             let mut buffer = self.output_buffer.lock().await;
-            // Buffer is already initialized with zeros and available count = capacity
+            let zeros = vec![0u8; self.config.buffer_size];
+            buffer.write(&zeros);
         }
 
         // Spawn only two contexts - input and output
@@ -486,20 +487,20 @@ mod tests {
     #[tokio::test]
     async fn test_ring_buffer() {
         let mut buffer = RingBuffer::new(10);
-        
+
         // Test write
         let written = buffer.write(&[1, 2, 3, 4, 5]);
         assert_eq!(written, 5);
-        assert_eq!(buffer.available_data(), 10); // 5 new + 5 zeros
-        
+        assert_eq!(buffer.available_data(), 5); // 5 bytes written
+
         // Test read
         let data = buffer.read(3);
-        assert_eq!(data, vec![0, 0, 0]); // Should read zeros first
-        assert_eq!(buffer.available_data(), 7);
-        
+        assert_eq!(data, vec![1, 2, 3]); // Should read the written data
+        assert_eq!(buffer.available_data(), 2);
+
         // Test wrap-around
         buffer.write(&[6, 7, 8]);
-        assert_eq!(buffer.available_data(), 10);
+        assert_eq!(buffer.available_data(), 5); // 2 remaining + 3 new
     }
 
     #[tokio::test]
