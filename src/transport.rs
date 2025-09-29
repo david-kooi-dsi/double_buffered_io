@@ -393,6 +393,10 @@ impl UartTransportFixedInput {
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
         let port = tokio_serial::new(port_name, baud_rate)
             .timeout(Duration::from_millis(100))
+            .flow_control(tokio_serial::FlowControl::None)  // Disable flow control
+            .data_bits(tokio_serial::DataBits::Eight)
+            .parity(tokio_serial::Parity::None)
+            .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
         Ok(Self {
@@ -454,19 +458,24 @@ impl UartTransportFixedInput {
         }
 
         let start_time = std::time::Instant::now();
-        log::debug!("UART: Starting receive_full for {} bytes", self.fixed_receive_size);
+        log::debug!("UART: Starting timed receive for {} bytes", self.fixed_receive_size);
 
         let mut port = self.port.lock().await;
         let mut total_received = 0;
 
-        while total_received < self.fixed_receive_size {
+        // At 460800 baud, 360 bytes should arrive in ~7.8ms
+        // Allow up to 50ms for the complete packet to arrive
+        let packet_timeout = Duration::from_millis(50);
+        let packet_deadline = start_time + packet_timeout;
+
+        while total_received < self.fixed_receive_size && std::time::Instant::now() < packet_deadline {
             let remaining = self.fixed_receive_size - total_received;
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
 
-            // Use a much shorter timeout for individual reads to avoid missing packets
-            let short_timeout = Duration::from_millis(100);
+            // Use very short timeout for individual reads within the packet window
+            let read_timeout = Duration::from_millis(5);
 
-            match tokio::time::timeout(short_timeout, port.read(buffer_slice)).await {
+            match tokio::time::timeout(read_timeout, port.read(buffer_slice)).await {
                 Ok(Ok(bytes_read)) => {
                     if bytes_read == 0 {
                         // Handle EOF or connection closed
@@ -498,7 +507,15 @@ impl UartTransportFixedInput {
         }
 
         let elapsed = start_time.elapsed();
-        log::debug!("UART: Completed receive_full in {:?}, got {} bytes", elapsed, total_received);
+        if total_received < self.fixed_receive_size {
+            log::warn!("UART: Timeout after {:?}, only received {}/{} bytes", elapsed, total_received, self.fixed_receive_size);
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Only received {}/{} bytes within packet timeout", total_received, self.fixed_receive_size)
+            )));
+        }
+
+        log::debug!("UART: Completed timed receive in {:?}, got {} bytes", elapsed, total_received);
         Ok(())
     }
 }
