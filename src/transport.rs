@@ -392,7 +392,6 @@ impl UartTransportFixedInput {
     /// * `Result<Self, Error>` - New UartTransportFixedInput instance or error
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
         let port = tokio_serial::new(port_name, baud_rate)
-            .timeout(Duration::from_millis(100))
             .flow_control(tokio_serial::FlowControl::None)  // Disable flow control
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
@@ -458,25 +457,18 @@ impl UartTransportFixedInput {
         }
 
         let start_time = std::time::Instant::now();
-        log::debug!("UART: Starting timed receive for {} bytes", self.fixed_receive_size);
+        log::debug!("UART: Starting blocking receive for {} bytes", self.fixed_receive_size);
 
         let mut port = self.port.lock().await;
         let mut total_received = 0;
 
-        // At 460800 baud, 360 bytes should arrive in ~7.8ms
-        // Allow up to 50ms for the complete packet to arrive
-        let packet_timeout = Duration::from_millis(50);
-        let packet_deadline = start_time + packet_timeout;
-
-        while total_received < self.fixed_receive_size && std::time::Instant::now() < packet_deadline {
+        while total_received < self.fixed_receive_size {
             let remaining = self.fixed_receive_size - total_received;
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
 
-            // Use very short timeout for individual reads within the packet window
-            let read_timeout = Duration::from_millis(5);
-
-            match tokio::time::timeout(read_timeout, port.read(buffer_slice)).await {
-                Ok(Ok(bytes_read)) => {
+            // Blocking read - wait until data arrives
+            match port.read(buffer_slice).await {
+                Ok(bytes_read) => {
                     if bytes_read == 0 {
                         // Handle EOF or connection closed
                         return Err(Error::Io(std::io::Error::new(
@@ -487,35 +479,14 @@ impl UartTransportFixedInput {
                     total_received += bytes_read;
                     log::debug!("UART: Read {} bytes, total: {}/{}", bytes_read, total_received, self.fixed_receive_size);
                 }
-                Ok(Err(e)) => {
-                    // Handle non-blocking case - retry without delay for better responsiveness
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // Use yield_now instead of sleep for better responsiveness
-                        tokio::task::yield_now().await;
-                        continue;
-                    } else {
-                        return Err(Error::Io(e));
-                    }
-                }
-                Err(_) => {
-                    // Short timeout occurred - yield and retry instead of failing
-                    // This allows the function to stay responsive to new data
-                    tokio::task::yield_now().await;
-                    continue;
+                Err(e) => {
+                    return Err(Error::Io(e));
                 }
             }
         }
 
         let elapsed = start_time.elapsed();
-        if total_received < self.fixed_receive_size {
-            log::warn!("UART: Timeout after {:?}, only received {}/{} bytes", elapsed, total_received, self.fixed_receive_size);
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Only received {}/{} bytes within packet timeout", total_received, self.fixed_receive_size)
-            )));
-        }
-
-        log::debug!("UART: Completed timed receive in {:?}, got {} bytes", elapsed, total_received);
+        log::debug!("UART: Completed blocking receive in {:?}, got {} bytes", elapsed, total_received);
         Ok(())
     }
 }
