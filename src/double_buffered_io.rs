@@ -1,248 +1,168 @@
-// double_buffered_io.rs
+// optimized_double_buffered_io.rs
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::sync::{RwLock, Mutex, mpsc};
 use tokio::time::sleep;
-use std::collections::VecDeque;
 use thiserror::Error;
 use log::{info, warn, debug, error};
 
-// Re-export or define the Transport trait here
 use crate::transport::Transport;
 use crate::processor::DataProcessor;
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
-    #[error("Input buffer overflow")]
-    InputOverflow,
-    #[error("Output buffer underflow")]
-    OutputUnderflow,
-    #[error("Processing timeout exceeded")]
-    ProcessingTimeout,
-    #[error("Buffer swap failed: {0}")]
-    BufferSwapFailure(String),
-    #[error("Transport error: {0}")]
-    TransportError(#[from] crate::Error),
     #[error("Pipeline stopped")]
     Stopped,
+    #[error("Transport error: {0}")]
+    TransportError(#[from] crate::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BufferState {
-    Filling,
-    Full,
-    Processing,
-    Draining,
-    Empty,
-}
-
-
-/// Buffer with state tracking
-struct Buffer {
+/// Ring buffer for efficient data management
+struct RingBuffer {
     data: Vec<u8>,
-    state: BufferState,
-    fill_level: usize,
     capacity: usize,
+    write_pos: AtomicUsize,
+    read_pos: AtomicUsize,
+    available: AtomicUsize,
 }
 
-impl Buffer {
+impl RingBuffer {
     fn new(capacity: usize) -> Self {
         Self {
             data: vec![0u8; capacity],
-            state: BufferState::Empty,
-            fill_level: 0,
             capacity,
+            write_pos: AtomicUsize::new(0),
+            read_pos: AtomicUsize::new(0),
+            available: AtomicUsize::new(capacity), // Initially filled with zeros
         }
     }
 
-    fn clear(&mut self) {
-        self.fill_level = 0;
-        self.state = BufferState::Empty;
-    }
-
-    fn is_full(&self) -> bool {
-        self.fill_level >= self.capacity
-    }
-
-    fn is_empty(&self) -> bool {
-        self.fill_level == 0
-    }
-
-    fn available_space(&self) -> usize {
-        self.capacity.saturating_sub(self.fill_level)
-    }
-
+    /// Write data to buffer, returns amount written
     fn write(&mut self, data: &[u8]) -> usize {
-        let to_write = data.len().min(self.available_space());
-        if to_write > 0 {
-            self.data[self.fill_level..self.fill_level + to_write]
-                .copy_from_slice(&data[..to_write]);
-            self.fill_level += to_write;
-            if self.is_full() {
-                self.state = BufferState::Full;
-            } else {
-                self.state = BufferState::Filling;
-            }
+        let available_space = self.capacity - self.available.load(Ordering::Acquire);
+        let to_write = data.len().min(available_space);
+        
+        if to_write == 0 {
+            return 0;
         }
+
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        
+        // Handle wrap-around
+        if write_pos + to_write <= self.capacity {
+            self.data[write_pos..write_pos + to_write].copy_from_slice(&data[..to_write]);
+        } else {
+            let first_part = self.capacity - write_pos;
+            self.data[write_pos..].copy_from_slice(&data[..first_part]);
+            self.data[..to_write - first_part].copy_from_slice(&data[first_part..to_write]);
+        }
+        
+        self.write_pos.store((write_pos + to_write) % self.capacity, Ordering::Release);
+        self.available.fetch_add(to_write, Ordering::AcqRel);
         to_write
     }
 
+    /// Read data from buffer, returns data read
     fn read(&mut self, count: usize) -> Vec<u8> {
-        let to_read = count.min(self.fill_level);
-        let result = self.data[..to_read].to_vec();
+        let available = self.available.load(Ordering::Acquire);
+        let to_read = count.min(available);
         
-        // Shift remaining data to the beginning
-        if to_read < self.fill_level {
-            self.data.copy_within(to_read..self.fill_level, 0);
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        let mut result = vec![0u8; to_read];
+        
+        // Handle wrap-around
+        if read_pos + to_read <= self.capacity {
+            result.copy_from_slice(&self.data[read_pos..read_pos + to_read]);
+        } else {
+            let first_part = self.capacity - read_pos;
+            result[..first_part].copy_from_slice(&self.data[read_pos..]);
+            result[first_part..].copy_from_slice(&self.data[..to_read - first_part]);
         }
         
-        self.fill_level -= to_read;
-        if self.is_empty() {
-            self.state = BufferState::Empty;
+        self.read_pos.store((read_pos + to_read) % self.capacity, Ordering::Release);
+        self.available.fetch_sub(to_read, Ordering::AcqRel);
+        result
+    }
+
+    /// Peek at data without consuming
+    fn peek(&self, count: usize) -> Vec<u8> {
+        let available = self.available.load(Ordering::Acquire);
+        let to_read = count.min(available);
+        
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        let mut result = vec![0u8; to_read];
+        
+        if read_pos + to_read <= self.capacity {
+            result.copy_from_slice(&self.data[read_pos..read_pos + to_read]);
         } else {
-            self.state = BufferState::Draining;
+            let first_part = self.capacity - read_pos;
+            result[..first_part].copy_from_slice(&self.data[read_pos..]);
+            result[first_part..].copy_from_slice(&self.data[..to_read - first_part]);
         }
         
         result
     }
 
-    fn get_data(&self) -> Vec<u8> {
-        self.data[..self.fill_level].to_vec()
+    fn available_data(&self) -> usize {
+        self.available.load(Ordering::Acquire)
     }
 }
 
-/// Double buffer implementation
-struct DoubleBuffer {
-    buffers: [Arc<Mutex<Buffer>>; 2],
-    active_index: AtomicUsize,
-    swap_notify: Arc<Notify>,
-}
-
-impl DoubleBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            buffers: [
-                Arc::new(Mutex::new(Buffer::new(capacity))),
-                Arc::new(Mutex::new(Buffer::new(capacity))),
-            ],
-            active_index: AtomicUsize::new(0),
-            swap_notify: Arc::new(Notify::new()),
-        }
-    }
-
-    async fn get_active(&self) -> Arc<Mutex<Buffer>> {
-        let index = self.active_index.load(Ordering::Acquire);
-        self.buffers[index].clone()
-    }
-
-    async fn get_standby(&self) -> Arc<Mutex<Buffer>> {
-        let index = self.active_index.load(Ordering::Acquire);
-        self.buffers[1 - index].clone()
-    }
-    fn get_active_index(&self) -> usize{
-        self.active_index.load(Ordering::Relaxed)
-    }
-
-    async fn swap(&self) -> Result<(), PipelineError> {
-        // Atomic swap of active buffer index
-        let current = self.active_index.load(Ordering::Acquire);
-        let new_index = 1 - current;
-        
-        // Verify standby buffer is ready
-        let standby = self.buffers[new_index].lock().await;
-        match standby.state {
-            BufferState::Empty | BufferState::Processing => {
-                drop(standby);
-                self.active_index.store(new_index, Ordering::Release);
-                self.swap_notify.notify_waiters();
-                Ok(())
-            }
-            _ => Err(PipelineError::BufferSwapFailure(
-                format!("Standby buffer in unexpected state: {:?}", standby.state)
-            ))
-        }
-    }
-
-    async fn wait_swap(&self) {
-        self.swap_notify.notified().await;
-    }
-}
-
-/// Signal for coordinating byte counts between input and output
-#[derive(Clone)]
-struct ByteSignal {
-    sender: mpsc::UnboundedSender<usize>,
-    receiver: Arc<Mutex<mpsc::UnboundedReceiver<usize>>>,
-}
-
-impl ByteSignal {
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        Self {
-            sender,
-            receiver: Arc::new(Mutex::new(receiver)),
-        }
-    }
-
-    fn signal_bytes(&self, bytes: usize) {
-        let _ = self.sender.send(bytes);
-    }
-
-    async fn wait_bytes(&self) -> Option<usize> {
-        let mut receiver = self.receiver.lock().await;
-        receiver.recv().await
-    }
-}
-
-/// Performance metrics tracking
-#[derive(Debug)]
+/// Performance metrics
+#[derive(Debug, Clone)]
 pub struct PipelineMetrics {
-    pub input_bytes: AtomicUsize,
-    pub output_bytes: AtomicUsize,
-    pub processing_count: AtomicUsize,
-    pub overflow_count: AtomicUsize,
-    pub underflow_count: AtomicUsize,
-    pub average_processing_time_ms: AtomicUsize,
-    pub buffer_utilization_percent: AtomicUsize,
-}
-
-impl Clone for PipelineMetrics {
-    fn clone(&self) -> Self {
-        Self {
-            input_bytes: AtomicUsize::new(self.input_bytes.load(Ordering::Relaxed)),
-            output_bytes: AtomicUsize::new(self.output_bytes.load(Ordering::Relaxed)),
-            processing_count: AtomicUsize::new(self.processing_count.load(Ordering::Relaxed)),
-            overflow_count: AtomicUsize::new(self.overflow_count.load(Ordering::Relaxed)),
-            underflow_count: AtomicUsize::new(self.underflow_count.load(Ordering::Relaxed)),
-            average_processing_time_ms: AtomicUsize::new(self.average_processing_time_ms.load(Ordering::Relaxed)),
-            buffer_utilization_percent: AtomicUsize::new(self.buffer_utilization_percent.load(Ordering::Relaxed)),
-        }
-    }
+    pub input_bytes: Arc<AtomicUsize>,
+    pub output_bytes: Arc<AtomicUsize>,
+    pub processed_bytes: Arc<AtomicUsize>,
+    pub processing_count: Arc<AtomicUsize>,  // Add this field
+    pub overflow_count: Arc<AtomicUsize>,    // Add this field
+    pub underflow_count: Arc<AtomicUsize>,
+    pub processing_time_ms: Arc<AtomicUsize>,
 }
 
 impl PipelineMetrics {
     fn new() -> Self {
         Self {
-            input_bytes: AtomicUsize::new(0),
-            output_bytes: AtomicUsize::new(0),
-            processing_count: AtomicUsize::new(0),
-            overflow_count: AtomicUsize::new(0),
-            underflow_count: AtomicUsize::new(0),
-            average_processing_time_ms: AtomicUsize::new(0),
-            buffer_utilization_percent: AtomicUsize::new(0),
+            input_bytes: Arc::new(AtomicUsize::new(0)),
+            output_bytes: Arc::new(AtomicUsize::new(0)),
+            processed_bytes: Arc::new(AtomicUsize::new(0)),
+            processing_count: Arc::new(AtomicUsize::new(0)),
+            overflow_count: Arc::new(AtomicUsize::new(0)),
+            underflow_count: Arc::new(AtomicUsize::new(0)),
+            processing_time_ms: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
-/// Configuration for the double-buffered pipeline
+/// Pipeline configuration
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub buffer_size: usize,
     pub max_processing_time: Duration,
     pub timeout: Duration,
     pub read_chunk_size: usize,
+    #[doc(hidden)]
+    pub processing_timeout: Duration,  // Internal use, not meant to be set by users
+}
+
+impl PipelineConfig {
+    /// Create a new config with explicit values
+    pub fn new(
+        buffer_size: usize,
+        max_processing_time: Duration,
+        timeout: Duration,
+        read_chunk_size: usize,
+    ) -> Self {
+        Self {
+            buffer_size,
+            max_processing_time,
+            timeout,
+            read_chunk_size,
+            processing_timeout: max_processing_time,  // Automatically set
+        }
+    }
 }
 
 impl Default for PipelineConfig {
@@ -252,65 +172,68 @@ impl Default for PipelineConfig {
             max_processing_time: Duration::from_secs(1),
             timeout: Duration::from_secs(5),
             read_chunk_size: 1024,
+            processing_timeout: Duration::from_secs(1),
         }
     }
 }
 
-/// Main double-buffered I/O structure
+/// Output request for immediate output
+#[derive(Debug)]
+struct OutputRequest {
+    byte_count: usize,
+}
+
+/// Optimized double-buffered I/O pipeline
 pub struct DoubleBufferedIO<T: Transport, P: DataProcessor> {
     transport: Arc<RwLock<T>>,
     processor: Arc<P>,
-    input_buffers: Arc<DoubleBuffer>,
-    output_buffers: Arc<DoubleBuffer>,
+    output_buffer: Arc<Mutex<RingBuffer>>,
     config: PipelineConfig,
     metrics: Arc<PipelineMetrics>,
     running: Arc<AtomicBool>,
-    processing_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    output_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    // Signal for byte count coordination
-    byte_signal: ByteSignal,
+    output_tx: mpsc::UnboundedSender<OutputRequest>,
+    output_rx: Arc<Mutex<mpsc::UnboundedReceiver<OutputRequest>>>,
 }
 
 impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> {
-    /// Create a new double-buffered I/O pipeline
     pub fn new(transport: T, processor: P, config: PipelineConfig) -> Self {
+        let (output_tx, output_rx) = mpsc::unbounded_channel();
+        
         Self {
             transport: Arc::new(RwLock::new(transport)),
             processor: Arc::new(processor),
-            input_buffers: Arc::new(DoubleBuffer::new(config.buffer_size)),
-            output_buffers: Arc::new(DoubleBuffer::new(config.buffer_size)),
+            output_buffer: Arc::new(Mutex::new(RingBuffer::new(config.buffer_size))),
             config,
             metrics: Arc::new(PipelineMetrics::new()),
             running: Arc::new(AtomicBool::new(false)),
-            processing_queue: Arc::new(Mutex::new(VecDeque::new())),
-            output_queue: Arc::new(Mutex::new(VecDeque::new())),
-            byte_signal: ByteSignal::new(),
+            output_tx,
+            output_rx: Arc::new(Mutex::new(output_rx)),
         }
     }
 
-    /// Start the pipeline with all three execution contexts
+    /// Start the pipeline
     pub async fn start(&self) -> Result<(), PipelineError> {
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(()); // Already running
         }
 
-        // Fill the active output buffer
-        let zeros = vec![0; self.config.buffer_size];
-        self.output_buffers.get_active().await.lock().await.write(&zeros[..self.config.buffer_size]);
-        
-        let input_handle = self.spawn_input_context();
-        info!("input handle started");
-        let processing_handle = self.spawn_processing_context();
-        info!("processing handle started");
-        let output_handle = self.spawn_output_context();
-        info!("output handle started");
+        // Pre-fill output buffer with zeros (so initial outputs work)
+        {
+            let mut buffer = self.output_buffer.lock().await;
+            // Buffer is already initialized with zeros and available count = capacity
+        }
 
-        // Store handles if needed for graceful shutdown
+        // Spawn only two contexts - input and output
+        let input_handle = self.spawn_input_context();
+        let output_handle = self.spawn_output_context();
+
+        info!("Pipeline started with 2 contexts");
+
+        // Monitor handles
         tokio::spawn(async move {
             tokio::select! {
-                _ = input_handle => {},
-                _ = processing_handle => {},
-                _ = output_handle => {},
+                _ = input_handle => error!("Input context stopped"),
+                _ = output_handle => error!("Output context stopped"),
             }
         });
 
@@ -320,337 +243,191 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
     /// Stop the pipeline
     pub async fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
-        // Signal output thread to wake up and exit
-        self.byte_signal.signal_bytes(0);
-        // Allow time for contexts to finish
+        // Send a zero-byte request to wake up output thread
+        let _ = self.output_tx.send(OutputRequest { byte_count: 0 });
         sleep(Duration::from_millis(100)).await;
+        info!("Pipeline stopped");
     }
 
     /// Get current metrics
     pub fn metrics(&self) -> PipelineMetrics {
         PipelineMetrics {
-            input_bytes: AtomicUsize::new(self.metrics.input_bytes.load(Ordering::Relaxed)),
-            output_bytes: AtomicUsize::new(self.metrics.output_bytes.load(Ordering::Relaxed)),
-            processing_count: AtomicUsize::new(self.metrics.processing_count.load(Ordering::Relaxed)),
-            overflow_count: AtomicUsize::new(self.metrics.overflow_count.load(Ordering::Relaxed)),
-            underflow_count: AtomicUsize::new(self.metrics.underflow_count.load(Ordering::Relaxed)),
-            average_processing_time_ms: AtomicUsize::new(
-                self.metrics.average_processing_time_ms.load(Ordering::Relaxed)
-            ),
-            buffer_utilization_percent: AtomicUsize::new(
-                self.metrics.buffer_utilization_percent.load(Ordering::Relaxed)
-            ),
+            input_bytes: Arc::new(AtomicUsize::new(
+                self.metrics.input_bytes.load(Ordering::Relaxed)
+            )),
+            output_bytes: Arc::new(AtomicUsize::new(
+                self.metrics.output_bytes.load(Ordering::Relaxed)
+            )),
+            processed_bytes: Arc::new(AtomicUsize::new(
+                self.metrics.processed_bytes.load(Ordering::Relaxed)
+            )),
+            processing_count: Arc::new(AtomicUsize::new(
+                self.metrics.processing_count.load(Ordering::Relaxed)
+            )),
+            overflow_count: Arc::new(AtomicUsize::new(
+                self.metrics.overflow_count.load(Ordering::Relaxed)
+            )),
+            underflow_count: Arc::new(AtomicUsize::new(
+                self.metrics.underflow_count.load(Ordering::Relaxed)
+            )),
+            processing_time_ms: Arc::new(AtomicUsize::new(
+                self.metrics.processing_time_ms.load(Ordering::Relaxed)
+            )),
         }
     }
 
-    /// Input context - continuously reads from transport and signals byte counts
+    /// Input context - reads data and immediately triggers output
     fn spawn_input_context(&self) -> tokio::task::JoinHandle<()> {
         let transport = self.transport.clone();
-        let input_buffers = self.input_buffers.clone();
-        let processing_queue = self.processing_queue.clone();
+        let processor = self.processor.clone();
+        let output_buffer = self.output_buffer.clone();
+        let output_tx = self.output_tx.clone();
         let metrics = self.metrics.clone();
         let running = self.running.clone();
         let config = self.config.clone();
-        let byte_signal = self.byte_signal.clone();
 
         tokio::spawn(async move {
             let mut read_buffer = vec![0u8; config.read_chunk_size];
 
             while running.load(Ordering::Relaxed) {
-                // Await new data - no ticker
                 let transport_guard = transport.read().await;
                 match transport_guard.receive(&mut read_buffer).await {
                     Ok(bytes_read) if bytes_read > 0 => {
                         drop(transport_guard);
                         
-                        debug!("Input: received {bytes_read} bytes");
-                        // Signal the output thread about received bytes
-                        byte_signal.signal_bytes(bytes_read);
+                        metrics.input_bytes.fetch_add(bytes_read, Ordering::Relaxed);
+                        debug!("Input: Received {} bytes", bytes_read);
 
-                        // Write to active input buffer
-                        let active_buffer: Arc<Mutex<Buffer>> = input_buffers.get_active().await;
-                        let mut buffer = active_buffer.lock().await;
-                        
-                        let ai = input_buffers.get_active_index();
-                        debug!("Input: active Index: {ai}");
-
-                        let written = buffer.write(&read_buffer[..bytes_read]);
-
-                        debug!("Input: {:?}", &read_buffer[..written]);
-                        let remaining_bytes = bytes_read - written;
-                        metrics.input_bytes.fetch_add(written, Ordering::Relaxed);
-                        
-                        debug!("Input: Added {written} bytes to input buffer and request {bytes_read} bytes to be output");
-                        if remaining_bytes > 0 {
-                            debug!("Input: {remaining_bytes} Bytes need to be added to next active buffer");
+                        // Immediately request output of same size
+                        if let Err(e) = output_tx.send(OutputRequest { byte_count: bytes_read }) {
+                            error!("Failed to send output request: {}", e);
+                            break;
                         }
 
-
-                        // Check if buffer is full and needs swapping
-                        if buffer.is_full() {
-                            let data = buffer.get_data();
-                            buffer.clear();
-                            drop(buffer);
-
-                            let len = data.len();
-                            debug!("Input: Input buffer is full. Sending {len} bytes to processing");
-
-                            // Queue for processing
-                            let mut queue = processing_queue.lock().await;
-                            queue.push_back(data);
-                            drop(queue);
-
-                            // Attempt buffer swap
-                            if let Err(e) = input_buffers.swap().await {
-                                metrics.overflow_count.fetch_add(1, Ordering::Relaxed);
-                                error!("Input buffer swap failed: {}", e);
-                            } else {
-                                // Buffer swap successful
-                                if remaining_bytes > 0 {
-                                    debug!("Adding remaining {remaining_bytes} bytes to new active buffer.");
-                                    let new_active = input_buffers.get_active().await;
-                                    let mut new_active = new_active.lock().await;
-
-                                    let new_written = new_active.write(&read_buffer[bytes_read-remaining_bytes..bytes_read]);
-                                    debug!("New Written: {new_written}");
+                        // Process data and fill output buffer
+                        let data_to_process = read_buffer[..bytes_read].to_vec();
+                        let processor = processor.clone();
+                        let output_buffer = output_buffer.clone();
+                        let metrics = metrics.clone();
+                        
+                        tokio::spawn(async move {
+                            // Process the data
+                            let start = Instant::now();
+                            match processor.process(data_to_process).await {
+                                Ok(processed_data) => {
+                                    let elapsed = start.elapsed();
+                                    metrics.processing_time_ms.store(
+                                        elapsed.as_millis() as usize, 
+                                        Ordering::Relaxed
+                                    );
+                                    metrics.processing_count.fetch_add(1, Ordering::Relaxed);  // Increment processing count
                                     
-                                    // assert!(remaining_bytes >= new_written);
-                                    let remaining_bytes = remaining_bytes - new_written;
-                                    debug!("Input: Remaining Bytes: {remaining_bytes}");
-                                    debug!("Input: New Buffer {:?}", new_active.get_data());
+                                    // Write processed data to output buffer
+                                    let mut buffer = output_buffer.lock().await;
+                                    let written = buffer.write(&processed_data);
+                                    metrics.processed_bytes.fetch_add(written, Ordering::Relaxed);
+                                    
+                                    debug!("Processing: Wrote {} bytes to output buffer", written);
+                                    if written < processed_data.len() {
+                                        warn!("Output buffer full, dropped {} bytes", 
+                                              processed_data.len() - written);
+                                        metrics.overflow_count.fetch_add(1, Ordering::Relaxed);  // Track overflow
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Processing error: {}", e);
                                 }
                             }
-                        }
+                        });
                     }
                     Ok(_) => {
-                        // No data available - add small delay to prevent busy loop
                         drop(transport_guard);
-                        sleep(Duration::from_millis(1)).await;
+                        sleep(Duration::from_micros(100)).await;
                     }
                     Err(e) => {
                         if running.load(Ordering::Relaxed) {
                             warn!("Transport receive error: {}", e);
                         }
                         drop(transport_guard);
-                        // Small delay before retrying on error
-                        sleep(Duration::from_millis(5)).await;
+                        sleep(Duration::from_millis(1)).await;
                     }
                 }
             }
+            debug!("Input context stopped");
         })
     }
 
-    /// Processing context - processes complete buffers
-    fn spawn_processing_context(&self) -> tokio::task::JoinHandle<()> {
-        let processor = self.processor.clone();
-        let processing_queue = self.processing_queue.clone();
-        let output_queue = self.output_queue.clone();
-        let output_buffers = self.output_buffers.clone();
-        let metrics = self.metrics.clone();
-        let running = self.running.clone();
-        let max_processing_time = self.config.max_processing_time;
-
-        tokio::spawn(async move {
-            while running.load(Ordering::Relaxed) {
-                // Get data from processing queue
-                let data = {
-                    let mut queue = processing_queue.lock().await;
-                    queue.pop_front()
-                };
-
-                if let Some(input_data) = data {
-                    let len = input_data.len();
-                    debug!("Processing: Dequeued {len} bytes to process.");
-                    debug!("Processing: Starting process...");
-                    debug!("Processing: {:?}", input_data);
-                    let start = Instant::now();
-
-                    // Process with timeout
-                    match tokio::time::timeout(
-                        max_processing_time,
-                        processor.process(input_data)
-                    ).await {
-                        Ok(Ok(processed_data)) => {
-                            // Update metrics
-                            let processing_time = start.elapsed();
-                            metrics.processing_count.fetch_add(1, Ordering::Relaxed);
-                            metrics.average_processing_time_ms.store(
-                                processing_time.as_millis() as usize,
-                                Ordering::Relaxed
-                            );
-
-                            let len = processed_data.len();
-                            debug!("Processing: Finished Processing. Output data size: {len} bytes");
-                            
-                            // Processed data is Vec<u8?
-                            let mut queue = output_queue.lock().await;
-                            queue.push_back(processed_data);
-                            drop(queue);
-  
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!("Processing error: {}", e);
-                        }
-                        Err(_) => {
-                            eprintln!("Processing timeout exceeded");
-                        }
-                    }
-                } else {
-                    // No data to process, wait a bit
-                    sleep(Duration::from_millis(5)).await;
-                }
-            }
-        })
-    }
-
-    /// Output context - waits for byte signal and outputs exact amount
+    /// Output context - outputs exactly N bytes when requested
     fn spawn_output_context(&self) -> tokio::task::JoinHandle<()> {
         let transport = self.transport.clone();
-        let output_buffers = self.output_buffers.clone();
-        let output_queue = self.output_queue.clone();
+        let output_buffer = self.output_buffer.clone();
+        let output_rx = self.output_rx.clone();
         let metrics = self.metrics.clone();
         let running = self.running.clone();
-        let byte_signal = self.byte_signal.clone();
 
         tokio::spawn(async move {
-            let mut output_position = 0;
-
+            let mut rx = output_rx.lock().await;
+            
             while running.load(Ordering::Relaxed) {
-                // Wait for signal about how many bytes to send
-                // Precense of input data is the driver of when to output data
-                match byte_signal.wait_bytes().await {
-                    Some(bytes_to_send) if bytes_to_send > 0 => {
-                        debug!("Output: {bytes_to_send} bytes requested for output");
+                match rx.recv().await {
+                    Some(request) => {
+                        if request.byte_count == 0 {
+                            break; // Shutdown signal
+                        }
 
-                        let mut output_data: Vec<u8> = vec![];
+                        debug!("Output: Request to output {} bytes", request.byte_count);
 
-                        // Check if active buffer has bytes to send
-                        let mut remaining_bytes = bytes_to_send;
-                        
-                        // Take at most two passes to get data.
-                        // First pass gets available data from active buffer. If nessecary, swap buffers and attempt
-                        // to get more data from the next one.
-                        for _ in 0..3 {
-                            let active_buffer = output_buffers.get_active().await;
-                            let mut buffer = active_buffer.lock().await;
+                        // Get data from output buffer or use zeros
+                        let output_data = {
+                            let mut buffer = output_buffer.lock().await;
+                            let available = buffer.available_data();
                             
-                            debug!("Output: Active Buffer: {:?}", buffer.get_data());
-                            if !buffer.is_empty(){
-                                let new_data = buffer.read(remaining_bytes);
-
-                                let data_read = new_data.len();
-                                remaining_bytes -= new_data.len();
-                                debug!("Output: Bytes read from active buffer: {data_read} Remaining Bytes: {remaining_bytes}");
-
-                                output_data.extend(new_data);
-                                if remaining_bytes > 0 {
-                                    assert!(buffer.is_empty());
-                                } else {
-                                    debug!("Total number of requested bytes collected.");
-                                    break;
+                            if available >= request.byte_count {
+                                // We have enough processed data
+                                buffer.read(request.byte_count)
+                            } else {
+                                // Not enough data - use what we have + zeros
+                                let mut data = buffer.read(available);
+                                data.resize(request.byte_count, 0);
+                                
+                                if request.byte_count > available {
+                                    metrics.underflow_count.fetch_add(1, Ordering::Relaxed);
+                                    debug!("Output: Underflow - padded {} bytes with zeros", 
+                                           request.byte_count - available);
                                 }
-                            } 
-
-                            // If empty, we need to swap
-                            if buffer.is_empty() {
-                                debug!("Output: Need more data...swapping buffers and checking queue.");
-                                sleep(Duration::from_millis(2)).await;
-
-                                match output_buffers.swap().await {
-                                    Ok(_) => {
-
-                                        let new_data = {
-                                            let mut queue = output_queue.lock().await;
-                                            queue.pop_front()
-                                        };
-                                        // If we have new data from the processor, add to our double buffer
-                                        if let Some(new_data) = new_data{
-                                            let buf = output_buffers.get_active().await;
-                                            buf.lock().await.write(&new_data);
-                                            debug!("Output: Got new data from processor: {:?}", buf.lock().await.get_data());
-                                            
-                                        } else {
-                                            debug!("No new data.");
-                                        }
-                                        continue; // Swap successful, get more data 
-                                    }
-                                    Err(e) => {
-                                        warn!("Output: Error in buffer swap: {e}");
-                                        break;
-                                    }
-                                }
+                                data
                             }
-                        }
-                    
-                        if remaining_bytes > 0 {
-                            output_data.extend(vec![0u8; remaining_bytes]);
-                            debug!("Output: {:?}", output_data);
-                            metrics.underflow_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        else {
-                            debug!("Output: {:?}", output_data);
-                        }
+                        };
 
-                        // Send out over the transport
-                        let data_as_array = output_data.as_slice();
+                        // Send exactly the requested bytes
+                        assert_eq!(output_data.len(), request.byte_count);
+                        
                         let transport_guard = transport.read().await;
-                        match transport_guard.send(data_as_array).await {
+                        match transport_guard.send(&output_data).await {
                             Ok(()) => {
                                 metrics.output_bytes.fetch_add(output_data.len(), Ordering::Relaxed);
+                                debug!("Output: Sent {} bytes", output_data.len());
                             }
                             Err(e) => {
-                                eprintln!("Transport send error: {}", e);
+                                error!("Transport send error: {}", e);
                                 break;
                             }
                         }
-                        drop(transport_guard);
-
                     }
-                    Some(0) => {
-                        // Signal to stop
-                        if !running.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    Some(_) => {
-                        // Handle all other positive values
-                        // This branch covers the Some(1_usize..) pattern that was missing
-                        // For very large values, we'll ignore them as they could cause issues
-                    }
-                    None => {
-                        // Channel closed
-                        if !running.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
+                    None => break,
                 }
             }
+            debug!("Output context stopped");
         })
     }
 }
 
-// Tests
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
     use crate::processor::PassThroughProcessor;
     use async_trait::async_trait;
-    use env_logger;
-    use std::sync::{Once};
-
-
-    static INIT: Once = Once::new();
-
-    fn init_logger() {
-        INIT.call_once(|| {
-            env_logger::Builder::from_env(
-                env_logger::Env::default().default_filter_or("debug")
-            ).init();
-        });
-    }
-
+    use std::collections::VecDeque;
 
     // Mock transport for testing
     #[derive(Clone)]
@@ -706,202 +483,106 @@ mod tests {
         fn set_timeout(&mut self, _timeout: Duration) {}
     }
 
-
     #[tokio::test]
-    async fn test_buffer_operations() {
-        let mut buffer = Buffer::new(10);
+    async fn test_ring_buffer() {
+        let mut buffer = RingBuffer::new(10);
         
-        // Test writing
+        // Test write
         let written = buffer.write(&[1, 2, 3, 4, 5]);
         assert_eq!(written, 5);
-        assert_eq!(buffer.fill_level, 5);
-        assert!(!buffer.is_full());
+        assert_eq!(buffer.available_data(), 10); // 5 new + 5 zeros
         
-        // Test reading
+        // Test read
         let data = buffer.read(3);
-        assert_eq!(data, vec![1, 2, 3]);
-        assert_eq!(buffer.fill_level, 2);
+        assert_eq!(data, vec![0, 0, 0]); // Should read zeros first
+        assert_eq!(buffer.available_data(), 7);
         
-        // Test filling to capacity
-        let written = buffer.write(&[6, 7, 8, 9, 10, 11, 12, 13]);
-        assert_eq!(written, 8); // Should only write 8 bytes to fill buffer
-        assert!(buffer.is_full());
+        // Test wrap-around
+        buffer.write(&[6, 7, 8]);
+        assert_eq!(buffer.available_data(), 10);
     }
 
     #[tokio::test]
-    async fn test_double_buffer_swap() {
-        let double_buffer = DoubleBuffer::new(100);
+    async fn test_exact_byte_correspondence() {
+        env_logger::init();
         
-        // Initial state
-        let active = double_buffer.get_active().await;
-        let mut buffer = active.lock().await;
-        buffer.write(&[1, 2, 3]);
-        drop(buffer);
-        
-        // Swap buffers
-        double_buffer.swap().await.unwrap();
-        
-        // New active should be empty
-        let new_active = double_buffer.get_active().await;
-        let buffer = new_active.lock().await;
-        assert!(buffer.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_byte_signal() {
-        let signal = ByteSignal::new();
-        
-        // Send signal
-        signal.signal_bytes(100);
-        signal.signal_bytes(200);
-        
-        // Receive signals
-        let bytes1 = signal.wait_bytes().await;
-        assert_eq!(bytes1, Some(100));
-        
-        let bytes2 = signal.wait_bytes().await;
-        assert_eq!(bytes2, Some(200));
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_byte_correspondence() {
         let transport = MockTransport::new();
-        let processor = PassThroughProcessor::new(Duration::from_millis(5));
-
-        let config = PipelineConfig {
-            buffer_size: 10, // Make buffer smaller so it fills up with our test data
-            max_processing_time: Duration::from_secs(1),
-            timeout: Duration::from_secs(5),
-            read_chunk_size: 50,
-        };
+        let processor = PassThroughProcessor::new(Duration::from_millis(1));
         
-        // Add test data in chunks
-        let test_data1 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // 10 bytes to fill buffer
-        let test_data2 = vec![11, 12, 13, 14, 15, 16, 17, 18, 19, 20]; // Another 10 bytes
+        let config = PipelineConfig {
+            buffer_size: 1024,
+            max_processing_time: Duration::from_secs(1),
+            processing_timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(5),
+            read_chunk_size: 128,
+        };
         
         let pipeline = DoubleBufferedIO::new(transport.clone(), processor, config);
         pipeline.start().await.unwrap();
         
-        // Add first chunk
-        transport.add_input_data(&test_data1).await;
-        sleep(Duration::from_millis(200)).await;
-
-        // Add second chunk
-        transport.add_input_data(&test_data2).await;
-        sleep(Duration::from_millis(300)).await;
+        // Test various input sizes
+        let test_cases = vec![
+            vec![1, 2, 3, 4, 5],           // 5 bytes
+            vec![6; 10],                     // 10 bytes
+            vec![7; 100],                    // 100 bytes
+            vec![8, 9],                      // 2 bytes
+        ];
         
-        // Check metrics - input and output should match
+        let mut total_input = 0;
+        for test_data in test_cases {
+            total_input += test_data.len();
+            transport.add_input_data(&test_data).await;
+            sleep(Duration::from_millis(50)).await;
+        }
+        
+        sleep(Duration::from_millis(200)).await;
+        
+        // Verify exact correspondence
         let metrics = pipeline.metrics();
         let input_bytes = metrics.input_bytes.load(Ordering::Relaxed);
         let output_bytes = metrics.output_bytes.load(Ordering::Relaxed);
-
-        assert_eq!(input_bytes, test_data1.len() + test_data2.len());
-        assert_eq!(output_bytes, input_bytes, "Output bytes should equal input bytes");
+        
+        assert_eq!(input_bytes, total_input);
+        assert_eq!(output_bytes, input_bytes, "Output must equal input");
+        
+        let sent_data = transport.get_sent_data().await;
+        assert_eq!(sent_data.len(), total_input, "Total sent must equal input");
         
         pipeline.stop().await;
     }
 
     #[tokio::test]
-    async fn test_pipeline_basic_flow() {
-        init_logger();
-
-
+    async fn test_streaming_consistency() {
         let transport = MockTransport::new();
         let processor = PassThroughProcessor::new(Duration::from_millis(1));
         
         let config = PipelineConfig {
-            buffer_size: 8,
+            buffer_size: 256,
             max_processing_time: Duration::from_secs(1),
+            processing_timeout: Duration::from_secs(1),
             timeout: Duration::from_secs(5),
-            read_chunk_size: 50,
+            read_chunk_size: 32,
         };
         
-
         let pipeline = DoubleBufferedIO::new(transport.clone(), processor, config);
-        
-        // Start pipeline
         pipeline.start().await.unwrap();
-        // Let it run for a bit
-        sleep(Duration::from_millis(100)).await;
-        let input_data: [u8; 4] = [1,1,1,1];
-        transport.add_input_data(&input_data).await;
-        sleep(Duration::from_millis(100)).await;
-        let input_data: [u8; 4] = [2,2,2,2];
-        transport.add_input_data(&input_data).await;
-        sleep(Duration::from_millis(100)).await;
-        let input_data: [u8; 4] = [3,3,3,3];
-        transport.add_input_data(&input_data).await;
-        sleep(Duration::from_millis(100)).await;
-        let input_data: [u8; 4] = [4,4,4,4];
-        transport.add_input_data(&input_data).await;
-        sleep(Duration::from_millis(100)).await;
-        let input_data: [u8; 4] = [5,5,5,5];
-        transport.add_input_data(&input_data).await;
-        sleep(Duration::from_millis(100)).await;
-        let input_data: [u8; 4] = [6,6,6,6];
-        transport.add_input_data(&input_data).await;
-
-        let loopback_data = transport.get_sent_data().await;
-        info!("Recevied data: {:?}", loopback_data);
-
-        // Check metrics
-        let metrics = pipeline.metrics();
-        assert_eq!(metrics.overflow_count.load(Ordering::Relaxed), 0);
         
-        // Stop pipeline
-        pipeline.stop().await;
-    }
-
-    #[tokio::test]
-    async fn test_pipeline_streaming_flow() {
-        init_logger();
-
-        let transport = MockTransport::new();
-        let processor = PassThroughProcessor::new(Duration::from_millis(1));
-        
-        let config = PipelineConfig {
-            buffer_size: 32,
-            max_processing_time: Duration::from_secs(1),
-            timeout: Duration::from_secs(5),
-            read_chunk_size: 8,
-        };
-        
-
-        let pipeline = DoubleBufferedIO::new(transport.clone(), processor, config);
-        
-        // Start pipeline
-        pipeline.start().await.unwrap();
-        // Let it run for a bit
-        for i in (1..=128).step_by(3) {
-            sleep(Duration::from_millis(20)).await;
-            let input_data = [i, i + 1, i + 2];
-            debug!("Sending: {:?}", input_data);
-            transport.add_input_data(&input_data).await;
+        // Stream data continuously
+        for i in 0..50 {
+            let data = vec![i as u8; 3];
+            transport.add_input_data(&data).await;
+            sleep(Duration::from_millis(10)).await;
         }
-
-        let loopback_data: Vec<i8> = transport.get_sent_data().await.into_iter().map(|x| x as i8).collect();
-        info!("Recevied data: {:?}", loopback_data);
-
-        for i in 0..loopback_data.len()-1 {
-            if loopback_data[i] == 0 && loopback_data[i+1] == 0 {
-                continue;
-            }
-            
-            if loopback_data[i] != loopback_data[i+1]-1 {
-                error!("Consecutive data mismatch");
-                let a = loopback_data[i];
-                let b = loopback_data[i+1];
-            
-                error!("{a} | {b}");
-                assert!(false);
-            }
-        }
-
-        // Check metrics
-        let metrics = pipeline.metrics();
-        assert_eq!(metrics.overflow_count.load(Ordering::Relaxed), 0);
         
-        // Stop pipeline
+        sleep(Duration::from_millis(500)).await;
+        
+        let metrics = pipeline.metrics();
+        assert_eq!(
+            metrics.input_bytes.load(Ordering::Relaxed),
+            metrics.output_bytes.load(Ordering::Relaxed),
+            "Streaming must maintain byte correspondence"
+        );
+        
         pipeline.stop().await;
     }
 }

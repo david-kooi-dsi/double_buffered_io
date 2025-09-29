@@ -8,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use thiserror::Error;
+use std::time::{Instant};
+use log::{debug, info};
 
 /// Error types for the transport layer
 #[derive(Debug, Error)]
@@ -150,18 +152,34 @@ impl UartTransport {
 
 #[async_trait]
 impl Transport for UartTransport {
-    async fn send(&self, data: &[u8]) -> Result<(), Error> {
+        async fn send(&self, data: &[u8]) -> Result<(), Error> {
         let mut port = self.port.lock().await;
         let timeout = *self.timeout.lock().await;
+        
+        let now = Instant::now();
+        
+        // Use eprintln! for immediate output to stderr (unbuffered)
+        eprintln!("UART SEND: {} bytes at {:?}", data.len(), now);
+        eprintln!("  First 20 bytes: {:?}", &data[..data.len().min(20)]);
+        
+        // Also use the log system
+        debug!("UART SEND: {} bytes, data: {:?}", data.len(), &data[..data.len().min(50)]);
         
         match tokio::time::timeout(timeout, port.write_all(data)).await {
             Ok(Ok(())) => {
                 // Ensure data is flushed
                 port.flush().await?;
+                eprintln!("UART SEND COMPLETE: {} bytes successfully sent", data.len());
                 Ok(())
             }
-            Ok(Err(e)) => Err(Error::Io(e)),
-            Err(_) => Err(Error::Timeout),
+            Ok(Err(e)) => {
+                eprintln!("UART SEND ERROR: {}", e);
+                Err(Error::Io(e))
+            }
+            Err(_) => {
+                eprintln!("UART SEND TIMEOUT after {:?}", timeout);
+                Err(Error::Timeout)
+            }
         }
     }
 
@@ -477,11 +495,13 @@ impl Transport for UartTransportFixedInput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
         let mut port = self.port.lock().await;
         let timeout = *self.timeout.lock().await;
-        
+        let now = Instant::now();
+
         match tokio::time::timeout(timeout, port.write_all(data)).await {
             Ok(Ok(())) => {
                 // Ensure data is flushed
                 port.flush().await?;
+                debug!("UART SEND: {} bytes at {:?}", data.len(), now);
                 Ok(())
             }
             Ok(Err(e)) => Err(Error::Io(e)),
