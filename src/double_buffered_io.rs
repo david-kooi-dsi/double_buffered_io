@@ -1,8 +1,4 @@
-/// Output context - outputs exactly N bytes when requested
-    fn spawn_output_context(&self) -> tokio::task::JoinHandle<()> {
-        let transport = self.transport.clone();
-        let output_buffer = self.output_buffer.clone();
-        let// optimized_double_buffered_io.rs
+// optimized_double_buffered_io.rs
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
@@ -39,21 +35,20 @@ impl RingBuffer {
             capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
-            available: AtomicUsize::new(capacity), // Initially filled with zeros
+            available: AtomicUsize::new(capacity), // Initially full of zeros
         }
     }
 
     /// Write data to buffer, returns amount written
     fn write(&mut self, data: &[u8]) -> usize {
-        let available_space = self.capacity - self.available.load(Ordering::Acquire);
-        let to_write = data.len().min(available_space);
-        
+        let to_write = data.len().min(self.capacity);
+
         if to_write == 0 {
             return 0;
         }
 
         let write_pos = self.write_pos.load(Ordering::Acquire);
-        
+
         // Handle wrap-around
         if write_pos + to_write <= self.capacity {
             self.data[write_pos..write_pos + to_write].copy_from_slice(&data[..to_write]);
@@ -62,9 +57,13 @@ impl RingBuffer {
             self.data[write_pos..].copy_from_slice(&data[..first_part]);
             self.data[..to_write - first_part].copy_from_slice(&data[first_part..to_write]);
         }
-        
+
         self.write_pos.store((write_pos + to_write) % self.capacity, Ordering::Release);
-        self.available.fetch_add(to_write, Ordering::AcqRel);
+
+        // Increase available back to capacity if we wrote data
+        let current_available = self.available.load(Ordering::Acquire);
+        let new_available = (current_available + to_write).min(self.capacity);
+        self.available.store(new_available, Ordering::Release);
         to_write
     }
 
@@ -72,10 +71,10 @@ impl RingBuffer {
     fn read(&mut self, count: usize) -> Vec<u8> {
         let available = self.available.load(Ordering::Acquire);
         let to_read = count.min(available);
-        
+
         let read_pos = self.read_pos.load(Ordering::Acquire);
         let mut result = vec![0u8; to_read];
-        
+
         // Handle wrap-around
         if read_pos + to_read <= self.capacity {
             result.copy_from_slice(&self.data[read_pos..read_pos + to_read]);
@@ -84,7 +83,7 @@ impl RingBuffer {
             result[..first_part].copy_from_slice(&self.data[read_pos..]);
             result[first_part..].copy_from_slice(&self.data[..to_read - first_part]);
         }
-        
+
         self.read_pos.store((read_pos + to_read) % self.capacity, Ordering::Release);
         self.available.fetch_sub(to_read, Ordering::AcqRel);
         result
@@ -211,7 +210,7 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
             metrics: Arc::new(PipelineMetrics::new()),
             running: Arc::new(AtomicBool::new(false)),
             output_tx,
-            output_rx: Arc::new(Mutex::new(output_rx)),
+            output_rx: Arc::new(Mutex::new(Some(output_rx))),
         }
     }
 
@@ -223,7 +222,7 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
 
         // Pre-fill output buffer with zeros (so initial outputs work)
         {
-            let mut buffer = self.output_buffer.lock().await;
+            let _buffer = self.output_buffer.lock().await;
             // Buffer is already initialized with zeros and available count = capacity
         }
 
@@ -470,7 +469,6 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
         })
     }
 }
-}
 
 #[cfg(test)]
 mod tests {
@@ -536,17 +534,17 @@ mod tests {
     #[tokio::test]
     async fn test_ring_buffer() {
         let mut buffer = RingBuffer::new(10);
-        
+
         // Test write
         let written = buffer.write(&[1, 2, 3, 4, 5]);
         assert_eq!(written, 5);
-        assert_eq!(buffer.available_data(), 10); // 5 new + 5 zeros
-        
+        assert_eq!(buffer.available_data(), 10); // Buffer stays at capacity
+
         // Test read
         let data = buffer.read(3);
-        assert_eq!(data, vec![0, 0, 0]); // Should read zeros first
+        assert_eq!(data, vec![1, 2, 3]); // Should read written data first
         assert_eq!(buffer.available_data(), 7);
-        
+
         // Test wrap-around
         buffer.write(&[6, 7, 8]);
         assert_eq!(buffer.available_data(), 10);

@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use thiserror::Error;
 use std::time::{Instant};
-use log::{debug, info};
+use log::debug;
 
 /// Error types for the transport layer
 #[derive(Debug, Error)]
@@ -515,11 +515,11 @@ impl Transport for UartTransportFixedInput {
         Ok(self.fixed_receive_size)
     }
 
-    async fn receive_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
+    async fn receive_from(&self, _buffer: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
         Err(Error::InvalidOperation("receive_from not implemented".to_string()))
     }
 
-    async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<(), Error> {
+    async fn send_to(&self, _data: &[u8], _addr: SocketAddr) -> Result<(), Error> {
         Err(Error::InvalidOperation("send_to not implemented".to_string()))
     }
 
