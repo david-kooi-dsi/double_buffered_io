@@ -1,4 +1,8 @@
-// optimized_double_buffered_io.rs
+/// Output context - outputs exactly N bytes when requested
+    fn spawn_output_context(&self) -> tokio::task::JoinHandle<()> {
+        let transport = self.transport.clone();
+        let output_buffer = self.output_buffer.clone();
+        let// optimized_double_buffered_io.rs
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
@@ -35,7 +39,7 @@ impl RingBuffer {
             capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
-            available: AtomicUsize::new(0), // Initially empty
+            available: AtomicUsize::new(capacity), // Initially filled with zeros
         }
     }
 
@@ -192,7 +196,7 @@ pub struct DoubleBufferedIO<T: Transport, P: DataProcessor> {
     metrics: Arc<PipelineMetrics>,
     running: Arc<AtomicBool>,
     output_tx: mpsc::UnboundedSender<OutputRequest>,
-    output_rx: Arc<Mutex<mpsc::UnboundedReceiver<OutputRequest>>>,
+    output_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<OutputRequest>>>>,  // Wrapped in Option for taking
 }
 
 impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> {
@@ -220,8 +224,7 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
         // Pre-fill output buffer with zeros (so initial outputs work)
         {
             let mut buffer = self.output_buffer.lock().await;
-            let zeros = vec![0u8; self.config.buffer_size];
-            buffer.write(&zeros);
+            // Buffer is already initialized with zeros and available count = capacity
         }
 
         // Spawn only two contexts - input and output
@@ -289,61 +292,85 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
 
         tokio::spawn(async move {
             let mut read_buffer = vec![0u8; config.read_chunk_size];
+            
+            // Create a dedicated channel for processing results
+            let (process_tx, mut process_rx) = mpsc::unbounded_channel();
 
-            while running.load(Ordering::Relaxed) {
-                let transport_guard = transport.read().await;
-                match transport_guard.receive(&mut read_buffer).await {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        drop(transport_guard);
-                        
-                        metrics.input_bytes.fetch_add(bytes_read, Ordering::Relaxed);
-                        debug!("Input: Received {} bytes", bytes_read);
-
-                        // Immediately request output of same size
-                        if let Err(e) = output_tx.send(OutputRequest { byte_count: bytes_read }) {
-                            error!("Failed to send output request: {}", e);
-                            break;
-                        }
-
-                        // Process data and fill output buffer
-                        let data_to_process = read_buffer[..bytes_read].to_vec();
-                        let processor = processor.clone();
-                        let output_buffer = output_buffer.clone();
-                        let metrics = metrics.clone();
-                        
-                        tokio::spawn(async move {
-                            // Process the data
+            // Spawn a single dedicated processor task to handle all processing
+            let processor_handle = {
+                let processor = processor.clone();
+                let output_buffer = output_buffer.clone();
+                let metrics = metrics.clone();
+                let running = running.clone();
+                
+                tokio::spawn(async move {
+                    while running.load(Ordering::Relaxed) {
+                        if let Some(data) = process_rx.recv().await {
                             let start = Instant::now();
-                            match processor.process(data_to_process).await {
+                            match processor.process(data).await {
                                 Ok(processed_data) => {
                                     let elapsed = start.elapsed();
                                     metrics.processing_time_ms.store(
                                         elapsed.as_millis() as usize, 
                                         Ordering::Relaxed
                                     );
-                                    metrics.processing_count.fetch_add(1, Ordering::Relaxed);  // Increment processing count
+                                    metrics.processing_count.fetch_add(1, Ordering::Relaxed);
                                     
                                     // Write processed data to output buffer
                                     let mut buffer = output_buffer.lock().await;
                                     let written = buffer.write(&processed_data);
                                     metrics.processed_bytes.fetch_add(written, Ordering::Relaxed);
                                     
-                                    debug!("Processing: Wrote {} bytes to output buffer", written);
+                                    debug!("Processing: Wrote {} bytes to output buffer ({}ms)", 
+                                           written, elapsed.as_millis());
                                     if written < processed_data.len() {
                                         warn!("Output buffer full, dropped {} bytes", 
                                               processed_data.len() - written);
-                                        metrics.overflow_count.fetch_add(1, Ordering::Relaxed);  // Track overflow
+                                        metrics.overflow_count.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Err(e) => {
                                     error!("Processing error: {}", e);
                                 }
                             }
-                        });
+                        }
+                    }
+                })
+            };
+
+            while running.load(Ordering::Relaxed) {
+                debug!("Waiting for input...");
+                let transport_guard = transport.read().await;
+                debug!("Acquired transport lock");
+                match transport_guard.receive(&mut read_buffer).await {
+                    Ok(bytes_read) if bytes_read > 0 => {
+                        drop(transport_guard);
+                        let recv_time = Instant::now();
+                        
+                        metrics.input_bytes.fetch_add(bytes_read, Ordering::Relaxed);
+                        debug!("Input: Received {} bytes at {:?}", bytes_read, recv_time);
+
+                        // CRITICAL: Immediately request output of same size for minimum latency
+                        if let Err(e) = output_tx.send(OutputRequest { byte_count: bytes_read }) {
+                            error!("Failed to send output request: {}", e);
+                            break;
+                        }
+                        let send_time = Instant::now();
+                        debug!("Input: Output request sent, latency: {}µs", 
+                               (send_time - recv_time).as_micros());
+
+                        // Queue data for processing (non-blocking)
+                        let data_to_process = read_buffer[..bytes_read].to_vec();
+                        if let Err(e) = process_tx.send(data_to_process) {
+                            error!("Failed to queue for processing: {}", e);
+                        }
+                        
+                        // Immediately continue to next input without waiting
                     }
                     Ok(_) => {
                         drop(transport_guard);
-                        sleep(Duration::from_micros(100)).await;
+                        // Use yield_now instead of sleep for better responsiveness
+                        tokio::task::yield_now().await;
                     }
                     Err(e) => {
                         if running.load(Ordering::Relaxed) {
@@ -354,6 +381,10 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                     }
                 }
             }
+            
+            // Clean up processor task
+            drop(process_tx);
+            let _ = processor_handle.await;
             debug!("Input context stopped");
         })
     }
@@ -362,21 +393,30 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
     fn spawn_output_context(&self) -> tokio::task::JoinHandle<()> {
         let transport = self.transport.clone();
         let output_buffer = self.output_buffer.clone();
-        let output_rx = self.output_rx.clone();
+        let output_rx_arc = self.output_rx.clone();
         let metrics = self.metrics.clone();
         let running = self.running.clone();
 
         tokio::spawn(async move {
-            let mut rx = output_rx.lock().await;
+            // Take ownership of the receiver
+            let mut output_rx = {
+                let mut rx_option = output_rx_arc.lock().await;
+                rx_option.take().expect("Output receiver already taken")
+            };
+            
+            let mut request_count = 0u64;
             
             while running.load(Ordering::Relaxed) {
-                match rx.recv().await {
+                match output_rx.recv().await {
                     Some(request) => {
                         if request.byte_count == 0 {
                             break; // Shutdown signal
                         }
-
-                        debug!("Output: Request to output {} bytes", request.byte_count);
+                        
+                        request_count += 1;
+                        let start_time = Instant::now();
+                        debug!("Output[{}]: Request to output {} bytes at {:?}", 
+                               request_count, request.byte_count, start_time);
 
                         // Get data from output buffer or use zeros
                         let output_data = {
@@ -393,34 +433,43 @@ impl<T: Transport + 'static, P: DataProcessor + 'static> DoubleBufferedIO<T, P> 
                                 
                                 if request.byte_count > available {
                                     metrics.underflow_count.fetch_add(1, Ordering::Relaxed);
-                                    debug!("Output: Underflow - padded {} bytes with zeros", 
-                                           request.byte_count - available);
+                                    debug!("Output[{}]: Underflow - had {} bytes, padded {} with zeros", 
+                                           request_count, available, request.byte_count - available);
                                 }
                                 data
                             }
                         };
 
-                        // Send exactly the requested bytes
+                        // Send exactly the requested bytes IMMEDIATELY
                         assert_eq!(output_data.len(), request.byte_count);
                         
                         let transport_guard = transport.read().await;
+                        let send_start = Instant::now();
                         match transport_guard.send(&output_data).await {
                             Ok(()) => {
+                                drop(transport_guard);
                                 metrics.output_bytes.fetch_add(output_data.len(), Ordering::Relaxed);
-                                debug!("Output: Sent {} bytes", output_data.len());
+                                let total_latency = send_start.duration_since(start_time);
+                                debug!("Output[{}]: Sent {} bytes with {}µs total latency", 
+                                       request_count, output_data.len(), total_latency.as_micros());
                             }
                             Err(e) => {
+                                drop(transport_guard);
                                 error!("Transport send error: {}", e);
                                 break;
                             }
                         }
                     }
-                    None => break,
+                    None => {
+                        debug!("Output channel closed");
+                        break;
+                    }
                 }
             }
-            debug!("Output context stopped");
+            debug!("Output context stopped after {} requests", request_count);
         })
     }
+}
 }
 
 #[cfg(test)]
@@ -487,20 +536,20 @@ mod tests {
     #[tokio::test]
     async fn test_ring_buffer() {
         let mut buffer = RingBuffer::new(10);
-
+        
         // Test write
         let written = buffer.write(&[1, 2, 3, 4, 5]);
         assert_eq!(written, 5);
-        assert_eq!(buffer.available_data(), 5); // 5 bytes written
-
+        assert_eq!(buffer.available_data(), 10); // 5 new + 5 zeros
+        
         // Test read
         let data = buffer.read(3);
-        assert_eq!(data, vec![1, 2, 3]); // Should read the written data
-        assert_eq!(buffer.available_data(), 2);
-
+        assert_eq!(data, vec![0, 0, 0]); // Should read zeros first
+        assert_eq!(buffer.available_data(), 7);
+        
         // Test wrap-around
         buffer.write(&[6, 7, 8]);
-        assert_eq!(buffer.available_data(), 5); // 2 remaining + 3 new
+        assert_eq!(buffer.available_data(), 10);
     }
 
     #[tokio::test]
