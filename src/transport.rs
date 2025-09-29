@@ -453,6 +453,9 @@ impl UartTransportFixedInput {
                    self.fixed_receive_size, buffer.len());
         }
 
+        let start_time = std::time::Instant::now();
+        log::debug!("UART: Starting receive_full for {} bytes", self.fixed_receive_size);
+
         let mut port = self.port.lock().await;
         let mut total_received = 0;
 
@@ -473,6 +476,7 @@ impl UartTransportFixedInput {
                         )));
                     }
                     total_received += bytes_read;
+                    log::debug!("UART: Read {} bytes, total: {}/{}", bytes_read, total_received, self.fixed_receive_size);
                 }
                 Ok(Err(e)) => {
                     // Handle non-blocking case - retry without delay for better responsiveness
@@ -493,6 +497,8 @@ impl UartTransportFixedInput {
             }
         }
 
+        let elapsed = start_time.elapsed();
+        log::debug!("UART: Completed receive_full in {:?}, got {} bytes", elapsed, total_received);
         Ok(())
     }
 }
