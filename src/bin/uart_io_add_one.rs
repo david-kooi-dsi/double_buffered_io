@@ -14,7 +14,7 @@ use std::sync::Arc;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info")
+        env_logger::Env::default().default_filter_or("debug")
     )
     .format(|buf, record| {
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -74,7 +74,7 @@ async fn main() {
 
     // Configure pipeline
     let config = PipelineConfig {
-        buffer_size: 2048,
+        buffer_size: 160*3,
         max_processing_time: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
         read_chunk_size: fixed_input_size,
