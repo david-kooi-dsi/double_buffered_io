@@ -222,6 +222,7 @@ impl Transport for UartTransport {
     }
 }
 
+
 /// Builder pattern for UART transport configuration
 pub struct UartTransportBuilder {
     port_name: String,
@@ -302,77 +303,11 @@ impl UartTransportBuilder {
     }
 }
 
-// UDP Transport implementation for comparison/testing
-pub struct UdpTransport {
-    socket: Arc<tokio::net::UdpSocket>,
-    remote_addr: Option<SocketAddr>,
-    timeout: Duration,
-}
-
-impl UdpTransport {
-    /// Create a new UDP transport
-    pub async fn new(local_addr: &str, remote_addr: Option<&str>) -> Result<Self, Error> {
-        let socket = tokio::net::UdpSocket::bind(local_addr).await?;
-        let remote = remote_addr.map(|addr| addr.parse()).transpose()
-            .map_err(|e| Error::InvalidOperation(format!("Invalid address: {}", e)))?;
-        
-        Ok(Self {
-            socket: Arc::new(socket),
-            remote_addr: remote,
-            timeout: Duration::from_secs(5),
-        })
-    }
-
-    /// Connect to a remote address
-    pub async fn connect(&mut self, addr: &str) -> Result<(), Error> {
-        let addr: SocketAddr = addr.parse()
-            .map_err(|e| Error::InvalidOperation(format!("Invalid address: {}", e)))?;
-        self.socket.connect(addr).await?;
-        self.remote_addr = Some(addr);
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Transport for UdpTransport {
-    async fn send(&self, data: &[u8]) -> Result<(), Error> {
-        if let Some(addr) = self.remote_addr {
-            self.socket.send_to(data, addr).await?;
-        } else {
-            return Err(Error::NotConnected);
-        }
-        Ok(())
-    }
-
-    async fn receive(&self, buffer: &mut [u8]) -> Result<usize, Error> {
-        match tokio::time::timeout(self.timeout, self.socket.recv(buffer)).await {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(e)) => Err(Error::Io(e)),
-            Err(_) => Err(Error::Timeout),
-        }
-    }
-
-    async fn receive_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
-        match tokio::time::timeout(self.timeout, self.socket.recv_from(buffer)).await {
-            Ok(Ok((bytes, addr))) => Ok((bytes, addr)),
-            Ok(Err(e)) => Err(Error::Io(e)),
-            Err(_) => Err(Error::Timeout),
-        }
-    }
-
-    async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<(), Error> {
-        self.socket.send_to(data, addr).await?;
-        Ok(())
-    }
-
-    fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout;
-    }
-}
 
 pub struct UartTransportFixedInput {
-    // Single port shared between read and write operations
-    port: Arc<Mutex<SerialStream>>,
+    // TWO SEPARATE MUTEXES - This is the key!
+    read_port: Arc<Mutex<SerialStream>>,   // Only for reading
+    write_port: Arc<Mutex<SerialStream>>,  // Only for writing
     timeout: Arc<Mutex<Duration>>,
     port_name: String,
     baud_rate: u32,
@@ -380,23 +315,33 @@ pub struct UartTransportFixedInput {
 }
 
 impl UartTransportFixedInput {
-    /// Create a new UART transport with fixed input size
+    /// Create a new UART transport with SPLIT read/write locks
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
-        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets",
+        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (SPLIT LOCKS)",
                    port_name, baud_rate, fixed_receive_size);
 
-        // Open the port
-        let port = tokio_serial::new(port_name, baud_rate)
+        // Open the port for reading
+        let read_port = tokio_serial::new(port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        log::debug!("UART: Successfully opened port");
+        // For tokio-serial, we need to open the port twice
+        // Most Unix systems allow multiple opens of the same serial device
+        let write_port = tokio_serial::new(port_name, baud_rate)
+            .flow_control(tokio_serial::FlowControl::None)
+            .data_bits(tokio_serial::DataBits::Eight)
+            .parity(tokio_serial::Parity::None)
+            .stop_bits(tokio_serial::StopBits::One)
+            .open_native_async()?;
+
+        log::debug!("UART: Successfully created SPLIT read/write handles");
 
         Ok(Self {
-            port: Arc::new(Mutex::new(port)),
+            read_port: Arc::new(Mutex::new(read_port)),   // Separate mutex!
+            write_port: Arc::new(Mutex::new(write_port)), // Separate mutex!
             timeout: Arc::new(Mutex::new(Duration::from_millis(2500))),
             port_name: port_name.to_string(),
             baud_rate,
@@ -408,15 +353,23 @@ impl UartTransportFixedInput {
     pub async fn reconfigure(&mut self, baud_rate: u32) -> Result<(), Error> {
         self.baud_rate = baud_rate;
 
-        // Close and reopen with new settings
-        let port = tokio_serial::new(&self.port_name, baud_rate)
+        // Recreate both ports - opening the same device twice
+        let read_port = tokio_serial::new(&self.port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        *self.port.lock().await = port;
+        let write_port = tokio_serial::new(&self.port_name, baud_rate)
+            .flow_control(tokio_serial::FlowControl::None)
+            .data_bits(tokio_serial::DataBits::Eight)
+            .parity(tokio_serial::Parity::None)
+            .stop_bits(tokio_serial::StopBits::One)
+            .open_native_async()?;
+
+        *self.read_port.lock().await = read_port;
+        *self.write_port.lock().await = write_port;
 
         Ok(())
     }
@@ -430,7 +383,7 @@ impl UartTransportFixedInput {
         )
     }
 
-    /// Receive exactly `fixed_receive_size` bytes, blocking until all are received
+    /// Receive exactly `fixed_receive_size` bytes
     pub async fn receive_full(&self, buffer: &mut [u8]) -> Result<(), Error> {
         if self.fixed_receive_size > buffer.len() {
             panic!("Fixed receive size ({}) exceeds buffer length ({})", 
@@ -438,10 +391,10 @@ impl UartTransportFixedInput {
         }
 
         let wait_start = Instant::now();
-        let mut port = self.port.lock().await;
+        let mut port = self.read_port.lock().await;  // Lock ONLY read_port!
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
-            debug!("UART RECEIVE: Waited {:?} for lock", lock_time);
+            debug!("UART RECEIVE: Waited {:?} for READ lock", lock_time);
         }
 
         let timeout = *self.timeout.lock().await;
@@ -484,10 +437,10 @@ impl UartTransportFixedInput {
 impl Transport for UartTransportFixedInput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
         let wait_start = Instant::now();
-        let mut port = self.port.lock().await;
+        let mut port = self.write_port.lock().await;  // Lock ONLY write_port!
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
-            debug!("UART SEND: Waited {:?} for lock", lock_time);
+            debug!("UART SEND: Waited {:?} for WRITE lock", lock_time);
         }
 
         let timeout = *self.timeout.lock().await;
@@ -495,7 +448,6 @@ impl Transport for UartTransportFixedInput {
 
         match tokio::time::timeout(timeout, port.write_all(data)).await {
             Ok(Ok(())) => {
-                // Ensure data is flushed
                 port.flush().await?;
                 debug!("UART SEND: {} bytes at {:?}", data.len(), now);
                 Ok(())
@@ -506,7 +458,6 @@ impl Transport for UartTransportFixedInput {
     }
 
     async fn receive(&self, buffer: &mut [u8]) -> Result<usize, Error> {
-        // Use the fixed-size receive implementation
         self.receive_full(buffer).await?;
         Ok(self.fixed_receive_size)
     }
@@ -526,6 +477,9 @@ impl Transport for UartTransportFixedInput {
         });
     }
 }
+
+
+
 
 #[cfg(test)]
 mod tests {
