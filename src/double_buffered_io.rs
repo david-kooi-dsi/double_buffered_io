@@ -532,7 +532,7 @@ fn spawn_output_context(&self) -> tokio::task::JoinHandle<()> {
     let metrics = self.metrics.clone();
     let running = self.running.clone();
     let byte_signal = self.byte_signal.clone();
-    let writer = self.serial_read_stream.clone();
+    let writer = self.serial_write_stream.clone();
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
