@@ -52,7 +52,7 @@ async fn main() {
     println!();
 
     // Create UART transport
-    let fixed_input_size = 360;
+    let fixed_input_size = 320;
     let transport = match UartTransportFixedInput::new(device, baud_rate, fixed_input_size).await {
         Ok(transport) => {
             println!("✓ Successfully opened UART connection to {}", device);
