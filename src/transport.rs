@@ -371,9 +371,10 @@ impl Transport for UdpTransport {
 }
 
 pub struct UartTransportFixedInput {
-    // Split the port into separate read and write handles with independent locks
-    read_port: Arc<Mutex<SerialStream>>,
-    write_port: Arc<Mutex<SerialStream>>,
+    // Shared serial port with separate read and write locks to prevent contention
+    port: Arc<Mutex<SerialStream>>,
+    read_lock: Arc<Mutex<()>>,  // Empty mutex for read operations
+    write_lock: Arc<Mutex<()>>, // Empty mutex for write operations
     timeout: Arc<Mutex<Duration>>,
     port_name: String,
     baud_rate: u32,
@@ -386,27 +387,20 @@ impl UartTransportFixedInput {
         log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (split locks)",
                    port_name, baud_rate, fixed_receive_size);
 
-        // Open the port for reading
-        let read_port = tokio_serial::new(port_name, baud_rate)
+        // Open the port once
+        let port = tokio_serial::new(port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        // Open a second connection for writing (serial ports can be opened multiple times)
-        let write_port = tokio_serial::new(port_name, baud_rate)
-            .flow_control(tokio_serial::FlowControl::None)
-            .data_bits(tokio_serial::DataBits::Eight)
-            .parity(tokio_serial::Parity::None)
-            .stop_bits(tokio_serial::StopBits::One)
-            .open_native_async()?;
-
-        log::debug!("UART: Successfully created split read/write handles");
+        log::debug!("UART: Successfully created port with split read/write locks");
 
         Ok(Self {
-            read_port: Arc::new(Mutex::new(read_port)),
-            write_port: Arc::new(Mutex::new(write_port)),
+            port: Arc::new(Mutex::new(port)),
+            read_lock: Arc::new(Mutex::new(())),
+            write_lock: Arc::new(Mutex::new(())),
             timeout: Arc::new(Mutex::new(Duration::from_millis(2500))),
             port_name: port_name.to_string(),
             baud_rate,
@@ -418,23 +412,15 @@ impl UartTransportFixedInput {
     pub async fn reconfigure(&mut self, baud_rate: u32) -> Result<(), Error> {
         self.baud_rate = baud_rate;
 
-        // Close and reopen both ports with new settings
-        let new_read_port = tokio_serial::new(&self.port_name, baud_rate)
+        // Close and reopen the port with new settings
+        let new_port = tokio_serial::new(&self.port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        let new_write_port = tokio_serial::new(&self.port_name, baud_rate)
-            .flow_control(tokio_serial::FlowControl::None)
-            .data_bits(tokio_serial::DataBits::Eight)
-            .parity(tokio_serial::Parity::None)
-            .stop_bits(tokio_serial::StopBits::One)
-            .open_native_async()?;
-
-        *self.read_port.lock().await = new_read_port;
-        *self.write_port.lock().await = new_write_port;
+        *self.port.lock().await = new_port;
 
         Ok(())
     }
@@ -456,7 +442,8 @@ impl UartTransportFixedInput {
         }
 
         let wait_start = Instant::now();
-        let mut port = self.read_port.lock().await;
+        // First acquire the read lock to prevent contention with write operations
+        let _read_guard = self.read_lock.lock().await;
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
             debug!("UART RECEIVE: Waited {:?} for read lock", lock_time);
@@ -470,6 +457,8 @@ impl UartTransportFixedInput {
             debug!("UART RECEIVE: Waiting for {} more bytes", remaining);
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
 
+            // Now acquire the port lock for the actual read operation
+            let mut port = self.port.lock().await;
             match tokio::time::timeout(timeout, port.read(buffer_slice)).await {
                 Ok(Ok(bytes_read)) => {
                     if bytes_read == 0 {
@@ -479,8 +468,10 @@ impl UartTransportFixedInput {
                         )));
                     }
                     total_received += bytes_read;
+                    drop(port); // Release port lock quickly
                 }
                 Ok(Err(e)) => {
+                    drop(port); // Release port lock
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
@@ -488,7 +479,10 @@ impl UartTransportFixedInput {
                         return Err(Error::Io(e));
                     }
                 }
-                Err(_) => return Err(Error::Timeout),
+                Err(_) => {
+                    drop(port); // Release port lock
+                    return Err(Error::Timeout);
+                }
             }
         }
 
@@ -502,7 +496,8 @@ impl UartTransportFixedInput {
 impl Transport for UartTransportFixedInput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
         let wait_start = Instant::now();
-        let mut port = self.write_port.lock().await;
+        // First acquire the write lock to prevent contention with read operations
+        let _write_guard = self.write_lock.lock().await;
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
             debug!("UART SEND: Waited {:?} for write lock", lock_time);
@@ -511,6 +506,8 @@ impl Transport for UartTransportFixedInput {
         let timeout = *self.timeout.lock().await;
         let now = Instant::now();
 
+        // Now acquire the port lock for the actual write operation
+        let mut port = self.port.lock().await;
         match tokio::time::timeout(timeout, port.write_all(data)).await {
             Ok(Ok(())) => {
                 // Ensure data is flushed
