@@ -391,12 +391,39 @@ impl UartTransportFixedInput {
     /// 
     /// * `Result<Self, Error>` - New UartTransportFixedInput instance or error
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
-        let port = tokio_serial::new(port_name, baud_rate)
+        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets", port_name, baud_rate, fixed_receive_size);
+
+        let mut port = tokio_serial::new(port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)  // Disable flow control
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
+
+        // Try to configure the port for immediate data availability
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = port.as_raw_fd();
+
+            // Try to set low latency mode if available
+            unsafe {
+                let mut flags: libc::c_int = 0;
+                if libc::ioctl(fd, libc::TIOCMGET, &mut flags) == 0 {
+                    log::debug!("UART: Successfully accessed port control flags");
+                }
+
+                // Set VMIN=0, VTIME=0 for non-blocking reads
+                let mut termios: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut termios) == 0 {
+                    termios.c_cc[libc::VMIN] = 0;  // Return immediately with available data
+                    termios.c_cc[libc::VTIME] = 0; // No timeout
+                    if libc::tcsetattr(fd, libc::TCSANOW, &termios) == 0 {
+                        log::debug!("UART: Set VMIN=0, VTIME=0 for immediate data availability");
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             port: Arc::new(Mutex::new(port)),
@@ -457,36 +484,71 @@ impl UartTransportFixedInput {
         }
 
         let start_time = std::time::Instant::now();
-        log::debug!("UART: Starting blocking receive for {} bytes", self.fixed_receive_size);
+        log::debug!("UART: Starting adaptive receive for {} bytes", self.fixed_receive_size);
 
         let mut port = self.port.lock().await;
         let mut total_received = 0;
+        let mut consecutive_timeouts = 0;
 
         while total_received < self.fixed_receive_size {
             let remaining = self.fixed_receive_size - total_received;
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
 
-            // Blocking read - wait until data arrives
-            match port.read(buffer_slice).await {
-                Ok(bytes_read) => {
+            // Try to read all remaining bytes at once
+            log::debug!("UART: Attempting to read {} remaining bytes", remaining);
+
+            // Use moderate timeout that allows for driver buffering
+            let timeout = if total_received == 0 {
+                // First read: wait longer for packet to start arriving
+                Duration::from_millis(2000)
+            } else {
+                // Subsequent reads: shorter timeout since data should be flowing
+                Duration::from_millis(100)
+            };
+
+            match tokio::time::timeout(timeout, port.read(buffer_slice)).await {
+                Ok(Ok(bytes_read)) => {
                     if bytes_read == 0 {
-                        // Handle EOF or connection closed
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
-                            "Connection closed before receiving all data"
+                            "Connection closed"
                         )));
                     }
                     total_received += bytes_read;
+                    consecutive_timeouts = 0;
                     log::debug!("UART: Read {} bytes, total: {}/{}", bytes_read, total_received, self.fixed_receive_size);
                 }
-                Err(e) => {
-                    return Err(Error::Io(e));
+                Ok(Err(e)) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        tokio::task::yield_now().await;
+                        continue;
+                    } else {
+                        return Err(Error::Io(e));
+                    }
+                }
+                Err(_) => {
+                    consecutive_timeouts += 1;
+                    if total_received == 0 && consecutive_timeouts >= 3 {
+                        // No data arriving at all
+                        log::debug!("UART: No data received after {} timeouts", consecutive_timeouts);
+                        tokio::task::yield_now().await;
+                        consecutive_timeouts = 0;
+                        continue;
+                    } else if total_received > 0 && consecutive_timeouts >= 5 {
+                        // Partial packet timeout
+                        log::warn!("UART: Partial packet timeout after {} bytes", total_received);
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("Received only {}/{} bytes", total_received, self.fixed_receive_size)
+                        )));
+                    }
+                    tokio::task::yield_now().await;
                 }
             }
         }
 
         let elapsed = start_time.elapsed();
-        log::debug!("UART: Completed blocking receive in {:?}, got {} bytes", elapsed, total_received);
+        log::debug!("UART: Completed adaptive receive in {:?}, got {} bytes", elapsed, total_received);
         Ok(())
     }
 }
