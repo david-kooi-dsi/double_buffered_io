@@ -608,6 +608,7 @@ fn spawn_output_context(&self) -> tokio::task::JoinHandle<()> {
                     Ok(()) => {
                         metrics.output_bytes.fetch_add(output_data.len(), Ordering::Relaxed);
                         debug!("Output: Sent {} bytes", output_data.len());
+                        debug!("Output: {:?}", output_data);
                     }
                     Err(e) => {
                         eprintln!("Transport send error: {}", e);
