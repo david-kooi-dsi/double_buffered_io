@@ -52,7 +52,7 @@ impl AddOneProcessor {
 impl DataProcessor for AddOneProcessor {
     async fn process(&self, input: Vec<u8>) -> Result<Vec<u8>, PipelineError> {
         let output = input.into_iter().map(|b| b.wrapping_add(1)).collect();
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(0)).await;
         Ok(output)
     }
 }
