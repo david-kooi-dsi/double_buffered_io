@@ -371,9 +371,8 @@ impl Transport for UdpTransport {
 }
 
 pub struct UartTransportFixedInput {
-    // Split the port into separate read and write handles with independent locks
-    read_port: Arc<Mutex<SerialStream>>,
-    write_port: Arc<Mutex<SerialStream>>,
+    // Single port shared between read and write operations
+    port: Arc<Mutex<SerialStream>>,
     timeout: Arc<Mutex<Duration>>,
     port_name: String,
     baud_rate: u32,
@@ -381,33 +380,23 @@ pub struct UartTransportFixedInput {
 }
 
 impl UartTransportFixedInput {
-    /// Create a new UART transport with fixed input size and separate read/write locks
+    /// Create a new UART transport with fixed input size
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
-        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (split locks)", 
+        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets",
                    port_name, baud_rate, fixed_receive_size);
 
-        // Open the port for reading
-        let read_port = tokio_serial::new(port_name, baud_rate)
+        // Open the port
+        let port = tokio_serial::new(port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        // Open a second independent port instance for writing
-        // This provides separate read/write locks without fd duplication
-        let write_port = tokio_serial::new(port_name, baud_rate)
-            .flow_control(tokio_serial::FlowControl::None)
-            .data_bits(tokio_serial::DataBits::Eight)
-            .parity(tokio_serial::Parity::None)
-            .stop_bits(tokio_serial::StopBits::One)
-            .open_native_async()?;
-
-        log::debug!("UART: Successfully created split read/write handles");
+        log::debug!("UART: Successfully opened port");
 
         Ok(Self {
-            read_port: Arc::new(Mutex::new(read_port)),
-            write_port: Arc::new(Mutex::new(write_port)),
+            port: Arc::new(Mutex::new(port)),
             timeout: Arc::new(Mutex::new(Duration::from_millis(2500))),
             port_name: port_name.to_string(),
             baud_rate,
@@ -418,27 +407,17 @@ impl UartTransportFixedInput {
     /// Reconfigure the serial port with new settings
     pub async fn reconfigure(&mut self, baud_rate: u32) -> Result<(), Error> {
         self.baud_rate = baud_rate;
-        
-        // Need to close both ports and reopen with new settings
-        let read_port = tokio_serial::new(&self.port_name, baud_rate)
+
+        // Close and reopen with new settings
+        let port = tokio_serial::new(&self.port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        // Open a second independent port instance for writing
-        // This provides separate read/write locks without fd duplication
-        let write_port = tokio_serial::new(&self.port_name, baud_rate)
-            .flow_control(tokio_serial::FlowControl::None)
-            .data_bits(tokio_serial::DataBits::Eight)
-            .parity(tokio_serial::Parity::None)
-            .stop_bits(tokio_serial::StopBits::One)
-            .open_native_async()?;
+        *self.port.lock().await = port;
 
-        *self.read_port.lock().await = read_port;
-        *self.write_port.lock().await = write_port;
-        
         Ok(())
     }
 
@@ -459,10 +438,10 @@ impl UartTransportFixedInput {
         }
 
         let wait_start = Instant::now();
-        let mut port = self.read_port.lock().await;
+        let mut port = self.port.lock().await;
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
-            debug!("UART RECEIVE: Waited {:?} for read lock", lock_time);
+            debug!("UART RECEIVE: Waited {:?} for lock", lock_time);
         }
 
         let timeout = *self.timeout.lock().await;
@@ -505,10 +484,10 @@ impl UartTransportFixedInput {
 impl Transport for UartTransportFixedInput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
         let wait_start = Instant::now();
-        let mut port = self.write_port.lock().await;
+        let mut port = self.port.lock().await;
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
-            debug!("UART SEND: Waited {:?} for write lock", lock_time);
+            debug!("UART SEND: Waited {:?} for lock", lock_time);
         }
 
         let timeout = *self.timeout.lock().await;
