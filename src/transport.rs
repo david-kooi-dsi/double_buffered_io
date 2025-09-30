@@ -383,7 +383,7 @@ pub struct UartTransportFixedInput {
 impl UartTransportFixedInput {
     /// Create a new UART transport with fixed input size and separate read/write locks
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
-        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (split locks)", 
+        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (split locks)",
                    port_name, baud_rate, fixed_receive_size);
 
         // Open the port for reading
@@ -394,7 +394,7 @@ impl UartTransportFixedInput {
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        // Clone the serial stream for writing (both will share the same underlying port)
+        // Open a second connection for writing (serial ports can be opened multiple times)
         let write_port = tokio_serial::new(port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
@@ -417,25 +417,25 @@ impl UartTransportFixedInput {
     /// Reconfigure the serial port with new settings
     pub async fn reconfigure(&mut self, baud_rate: u32) -> Result<(), Error> {
         self.baud_rate = baud_rate;
-        
-        // Need to close both ports and reopen with new settings
-        let read_port = tokio_serial::new(&self.port_name, baud_rate)
+
+        // Close and reopen both ports with new settings
+        let new_read_port = tokio_serial::new(&self.port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        let write_port = tokio_serial::new(&self.port_name, baud_rate)
+        let new_write_port = tokio_serial::new(&self.port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        *self.read_port.lock().await = read_port;
-        *self.write_port.lock().await = write_port;
-        
+        *self.read_port.lock().await = new_read_port;
+        *self.write_port.lock().await = new_write_port;
+
         Ok(())
     }
 
@@ -451,7 +451,7 @@ impl UartTransportFixedInput {
     /// Receive exactly `fixed_receive_size` bytes, blocking until all are received
     pub async fn receive_full(&self, buffer: &mut [u8]) -> Result<(), Error> {
         if self.fixed_receive_size > buffer.len() {
-            panic!("Fixed receive size ({}) exceeds buffer length ({})", 
+            panic!("Fixed receive size ({}) exceeds buffer length ({})",
                    self.fixed_receive_size, buffer.len());
         }
 
@@ -469,7 +469,7 @@ impl UartTransportFixedInput {
             let remaining = self.fixed_receive_size - total_received;
             debug!("UART RECEIVE: Waiting for {} more bytes", remaining);
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
-            
+
             match tokio::time::timeout(timeout, port.read(buffer_slice)).await {
                 Ok(Ok(bytes_read)) => {
                     if bytes_read == 0 {
@@ -491,7 +491,7 @@ impl UartTransportFixedInput {
                 Err(_) => return Err(Error::Timeout),
             }
         }
-        
+
         let now = Instant::now();
         debug!("UART RECEIVE: Successfully received {} bytes at {:?}", total_received, now);
         Ok(())
@@ -544,7 +544,6 @@ impl Transport for UartTransportFixedInput {
         });
     }
 }
-
 
 #[cfg(test)]
 mod tests {
