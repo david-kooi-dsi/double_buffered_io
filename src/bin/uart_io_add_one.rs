@@ -14,7 +14,7 @@ use std::sync::Arc;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("debug")
+        env_logger::Env::default().default_filter_or("info")
     )
     .format(|buf, record| {
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -52,7 +52,7 @@ async fn main() {
     println!();
 
     // Create UART transport
-    let fixed_input_size = 320;
+    let fixed_input_size = 160;
     let transport = match UartTransportFixedInput::new(device, baud_rate, fixed_input_size).await {
         Ok(transport) => {
             println!("✓ Successfully opened UART connection to {}", device);
@@ -78,7 +78,7 @@ async fn main() {
         max_processing_time: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
         read_chunk_size: fixed_input_size,
-        processing_timeout: Duration::from_secs(1),
+        
     };
 
     // Create double-buffered I/O pipeline

@@ -67,8 +67,7 @@ async fn main() {
         buffer_size: 2048*2,
         max_processing_time: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
-        read_chunk_size: fixed_input_size,
-         processing_timeout: Duration::from_secs(1),
+        read_chunk_size: fixed_input_size
     };
 
     // Create double-buffered I/O pipeline
