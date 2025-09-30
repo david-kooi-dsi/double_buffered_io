@@ -10,6 +10,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use std::time::{Instant};
 use log::debug;
+use tokio_serial::SerialPort;
 
 /// Error types for the transport layer
 #[derive(Debug, Error)]
@@ -305,9 +306,9 @@ impl UartTransportBuilder {
 
 
 pub struct UartTransportFixedInput {
-    // TWO SEPARATE MUTEXES - This is the key!
-    read_port: Arc<Mutex<SerialStream>>,   // Only for reading
-    write_port: Arc<Mutex<SerialStream>>,  // Only for writing
+    // Separate SerialStream instances for read and write
+    read_port: Arc<Mutex<SerialStream>>,
+    write_port: Arc<Mutex<Box<dyn SerialPort + Send>>>,
     timeout: Arc<Mutex<Duration>>,
     port_name: String,
     baud_rate: u32,
@@ -315,33 +316,35 @@ pub struct UartTransportFixedInput {
 }
 
 impl UartTransportFixedInput {
-    /// Create a new UART transport with SPLIT read/write locks
+    /// Create a new UART transport with fixed input size using try_clone()
     pub async fn new(port_name: &str, baud_rate: u32, fixed_receive_size: usize) -> Result<Self, Error> {
-        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (SPLIT LOCKS)",
+        log::debug!("UART: Opening {} at {} baud for fixed {} byte packets (using try_clone)",
                    port_name, baud_rate, fixed_receive_size);
 
-        // Open the port for reading
-        let read_port = tokio_serial::new(port_name, baud_rate)
+        // Open the main port
+        let main_port = tokio_serial::new(port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        // For tokio-serial, we need to open the port twice
-        // Most Unix systems allow multiple opens of the same serial device
-        let write_port = tokio_serial::new(port_name, baud_rate)
-            .flow_control(tokio_serial::FlowControl::None)
-            .data_bits(tokio_serial::DataBits::Eight)
-            .parity(tokio_serial::Parity::None)
-            .stop_bits(tokio_serial::StopBits::One)
-            .open_native_async()?;
+        // Clone the port for writing
+        // try_clone() creates a new handle to the same port
+        let cloned_port = main_port.try_clone()
+            .map_err(|e| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to clone serial port: {}", e)
+            )))?;
 
-        log::debug!("UART: Successfully created SPLIT read/write handles");
+        // Keep the cloned port as a Box<dyn SerialPort>
+        let write_port = cloned_port;
+
+        log::debug!("UART: Successfully created separate read/write handles using try_clone()");
 
         Ok(Self {
-            read_port: Arc::new(Mutex::new(read_port)),   // Separate mutex!
-            write_port: Arc::new(Mutex::new(write_port)), // Separate mutex!
+            read_port: Arc::new(Mutex::new(main_port)),
+            write_port: Arc::new(Mutex::new(write_port)),
             timeout: Arc::new(Mutex::new(Duration::from_millis(2500))),
             port_name: port_name.to_string(),
             baud_rate,
@@ -350,27 +353,30 @@ impl UartTransportFixedInput {
     }
 
     /// Reconfigure the serial port with new settings
+    /// Note: Be careful with this when using cloned ports!
     pub async fn reconfigure(&mut self, baud_rate: u32) -> Result<(), Error> {
+        log::warn!("UART: Reconfiguring cloned ports - this may cause issues!");
         self.baud_rate = baud_rate;
-
-        // Recreate both ports - opening the same device twice
-        let read_port = tokio_serial::new(&self.port_name, baud_rate)
+        
+        // Need to recreate both ports with new settings
+        let main_port = tokio_serial::new(&self.port_name, baud_rate)
             .flow_control(tokio_serial::FlowControl::None)
             .data_bits(tokio_serial::DataBits::Eight)
             .parity(tokio_serial::Parity::None)
             .stop_bits(tokio_serial::StopBits::One)
             .open_native_async()?;
 
-        let write_port = tokio_serial::new(&self.port_name, baud_rate)
-            .flow_control(tokio_serial::FlowControl::None)
-            .data_bits(tokio_serial::DataBits::Eight)
-            .parity(tokio_serial::Parity::None)
-            .stop_bits(tokio_serial::StopBits::One)
-            .open_native_async()?;
+        let cloned_port = main_port.try_clone()
+            .map_err(|e| Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to clone serial port: {}", e)
+            )))?;
 
-        *self.read_port.lock().await = read_port;
+        let write_port = cloned_port;
+
+        *self.read_port.lock().await = main_port;
         *self.write_port.lock().await = write_port;
-
+        
         Ok(())
     }
 
@@ -391,7 +397,7 @@ impl UartTransportFixedInput {
         }
 
         let wait_start = Instant::now();
-        let mut port = self.read_port.lock().await;  // Lock ONLY read_port!
+        let mut port = self.read_port.lock().await;
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
             debug!("UART RECEIVE: Waited {:?} for READ lock", lock_time);
@@ -437,7 +443,7 @@ impl UartTransportFixedInput {
 impl Transport for UartTransportFixedInput {
     async fn send(&self, data: &[u8]) -> Result<(), Error> {
         let wait_start = Instant::now();
-        let mut port = self.write_port.lock().await;  // Lock ONLY write_port!
+        let mut port = self.write_port.lock().await;  // Using separate write port!
         let lock_time = wait_start.elapsed();
         if lock_time > Duration::from_millis(1) {
             debug!("UART SEND: Waited {:?} for WRITE lock", lock_time);
@@ -446,14 +452,14 @@ impl Transport for UartTransportFixedInput {
         let timeout = *self.timeout.lock().await;
         let now = Instant::now();
 
-        match tokio::time::timeout(timeout, port.write_all(data)).await {
-            Ok(Ok(())) => {
-                port.flush().await?;
+        // SerialPort write is not async, so we don't use timeout
+        match port.write_all(data) {
+            Ok(()) => {
+                port.flush()?;
                 debug!("UART SEND: {} bytes at {:?}", data.len(), now);
                 Ok(())
             }
-            Ok(Err(e)) => Err(Error::Io(e)),
-            Err(_) => Err(Error::Timeout),
+            Err(e) => Err(Error::Io(e)),
         }
     }
 
@@ -477,9 +483,6 @@ impl Transport for UartTransportFixedInput {
         });
     }
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -507,16 +510,5 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_udp_transport() {
-        let transport = UdpTransport::new("127.0.0.1:0", Some("127.0.0.1:8080"))
-            .await
-            .expect("Failed to create UDP transport");
-
-        // Test basic operations
-        let data = b"Hello, World!";
-        
-        // This will fail without a listener on the other end, but demonstrates usage
-        let _ = transport.send(data).await;
-    }
+    // UDP transport test removed - UdpTransport not implemented
 }
