@@ -8,7 +8,7 @@ pub mod double_buffered_io;
 pub mod processor;
 
 // Re-export main types for convenience
-pub use transport::{Transport, UartTransport, UdpTransport, Error};
+pub use transport::{Transport, UartTransport, UartTransportFixedInput, Error};
 pub use processor::{DataProcessor, PassThroughProcessor, AddOneProcessor};
 pub use double_buffered_io::{
     DoubleBufferedIO,
