@@ -415,6 +415,7 @@ dependencies = [
  "libc",
  "log",
  "metrics",
+ "mio-serial",
  "mockall",
  "parking_lot",
  "prometheus",

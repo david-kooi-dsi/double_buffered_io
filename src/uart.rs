@@ -237,7 +237,7 @@ impl UartTransportFixedInput {
 
         while total_received < self.fixed_receive_size {
             let remaining = self.fixed_receive_size - total_received;
-            log::debug!("UART RECEIVE: Waiting for {} more bytes", remaining);
+            //log::debug!("UART RECEIVE: Waiting for {} more bytes", remaining);
             let buffer_slice = &mut buffer[total_received..total_received + remaining];
             
             match port.read(buffer_slice) {
