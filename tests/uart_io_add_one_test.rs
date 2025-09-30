@@ -38,7 +38,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_processing_time: Duration::from_secs(1),
         timeout: Duration::from_secs(5),
         read_chunk_size: 1024,
-        processing_timeout: Duration::from_secs(1),
     };
 
     // Create and start the pipeline
@@ -61,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Pipeline metrics:");
     info!("  Input bytes: {}", metrics.input_bytes.load(std::sync::atomic::Ordering::Relaxed));
     info!("  Output bytes: {}", metrics.output_bytes.load(std::sync::atomic::Ordering::Relaxed));
-    info!("  Processed bytes: {}", metrics.processed_bytes.load(std::sync::atomic::Ordering::Relaxed));
+    info!("  Processing count: {}", metrics.processing_count.load(std::sync::atomic::Ordering::Relaxed));
     info!("  Processing count: {}", metrics.processing_count.load(std::sync::atomic::Ordering::Relaxed));
     info!("  Overflow count: {}", metrics.overflow_count.load(std::sync::atomic::Ordering::Relaxed));
     info!("  Underflow count: {}", metrics.underflow_count.load(std::sync::atomic::Ordering::Relaxed));
@@ -150,7 +149,6 @@ mod tests {
             max_processing_time: Duration::from_secs(1),
             timeout: Duration::from_secs(5),
             read_chunk_size: 128,
-            processing_timeout: Duration::from_secs(1),
         };
 
         let pipeline = DoubleBufferedIO::new(transport.clone(), processor, config);
